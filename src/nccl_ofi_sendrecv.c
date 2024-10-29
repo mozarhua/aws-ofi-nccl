@@ -825,10 +825,6 @@ static int sendrecv_comm_mr_base_reg(nccl_net_ofi_comm_t *base_comm,
 		 * Not needed for DMA buffers.
 		 */
 		nccl_ofi_mr_ckey_t aligned_key = nccl_ofi_mr_ckey_mk_aligned_dup(ckey, mr_cache);
-		NCCL_OFI_WARN("Registering MR debug: 0x%lx, size %ld, page %ld",
-			       nccl_ofi_mr_ckey_baseaddr(&aligned_key),
-                              nccl_ofi_mr_ckey_len(&aligned_key),
-                              (uintptr_t)mr_cache->system_page_size);
 		ret = sendrecv_mr_base_register(domain, ep->ofi_ep, key_pool,
 						dev_id, &aligned_key, type, &ret_handle);
 	} else {

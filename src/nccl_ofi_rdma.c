@@ -2955,7 +2955,16 @@ static int reg_mr_ep(nccl_net_ofi_rdma_ep_t *ep,
 		/* Cache miss */
 	}
 
-	ret = reg_mr_on_device(ep, ckey, type, &ret_handle);
+	if (mr_cache && nccl_ofi_mr_ckey_is_iovec(ckey)) {
+		/*
+		 * Use page aligned address to register for smaller allocations.
+		 * Not needed for DMA buffers.
+		 */
+		nccl_ofi_mr_ckey_t aligned_key = nccl_ofi_mr_ckey_mk_aligned_dup(ckey, mr_cache);
+		ret = reg_mr_on_device(ep, &aligned_key, type, &ret_handle);
+	} else {
+		ret = reg_mr_on_device(ep, ckey, type, &ret_handle);
+	}
 	if (OFI_UNLIKELY(ret != 0)) {
 		goto exit;
 	}

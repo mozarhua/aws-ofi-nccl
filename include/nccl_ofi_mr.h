@@ -126,6 +126,11 @@ static inline nccl_ofi_mr_ckey_t nccl_ofi_mr_ckey_mk_vec(void *iov_base, size_t 
 	};
 }
 
+static inline bool nccl_ofi_mr_ckey_is_iovec(nccl_ofi_mr_ckey_ref ckey)
+{
+	return ckey->type == NCCL_OFI_MR_CKEY_IOVEC;
+}
+
 static inline void nccl_ofi_mr_ckey_fill_mr_attrs(nccl_ofi_mr_ckey_ref ckey, struct fi_mr_attr *attrs, uint64_t *flags)
 {
 	assert(ckey->type != NCCL_OFI_MR_CKEY_INVALID);
@@ -138,6 +143,16 @@ static inline void nccl_ofi_mr_ckey_fill_mr_attrs(nccl_ofi_mr_ckey_ref ckey, str
 #endif
 	attrs->mr_iov = (const struct iovec *)ckey;
 	attrs->iov_count = 1;
+}
+
+static inline void nccl_ofi_mr_compute_page_address(uintptr_t addr,
+						    size_t size,
+						    uintptr_t system_page_size,
+						    uintptr_t *page_addr,
+						    size_t *pages)
+{
+	*page_addr = addr & -system_page_size; /* start of page of data */
+	*pages = (addr + size - (*page_addr) + system_page_size - 1) / system_page_size; /* Number of pages in buffer */
 }
 
 /**
@@ -203,6 +218,21 @@ int nccl_ofi_mr_cache_insert_entry(nccl_ofi_mr_cache_t *cache, nccl_ofi_mr_ckey_
  *	   -ENOENT, if no matching entry was found
  */
 int nccl_ofi_mr_cache_del_entry(nccl_ofi_mr_cache_t *cache, void *handle);
+
+/**
+ * Generate a duplicated key with start and len aligned to cache's
+ * system_page_size. This is for callers of nccl_ofi_mr_cache_insert_entry()
+ * to register memory regions which fit the lookup page start and sizes.
+ * @return new nccl_ofi_mr_ckey_t, with base and len aligned.
+ */
+static inline nccl_ofi_mr_ckey_t nccl_ofi_mr_ckey_mk_aligned_dup(nccl_ofi_mr_ckey_ref ckey, nccl_ofi_mr_cache_t *cache)
+{
+	uintptr_t page_addr;
+	size_t pages;
+	nccl_ofi_mr_compute_page_address(nccl_ofi_mr_ckey_baseaddr(ckey), nccl_ofi_mr_ckey_len(ckey),
+					 (uintptr_t)cache->system_page_size, &page_addr, &pages);
+	return nccl_ofi_mr_ckey_mk_vec((void*) page_addr, pages * cache->system_page_size);
+}
 
 #ifdef __cplusplus
 }  // End extern "C"

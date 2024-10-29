@@ -96,23 +96,13 @@ out:
 	return ret;
 }
 
-static inline void compute_page_address(uintptr_t addr,
-					size_t size,
-					uintptr_t system_page_size,
-					uintptr_t *page_addr,
-					size_t *pages)
-{
-	*page_addr = addr & -system_page_size; /* start of page of data */
-	*pages = (addr + size - (*page_addr) + system_page_size - 1) / system_page_size; /* Number of pages in buffer */
-}
-
 void *nccl_ofi_mr_cache_lookup_entry(nccl_ofi_mr_cache_t *cache,
 				     nccl_ofi_mr_ckey_ref ckey)
 {
 	uintptr_t page_addr;
 	size_t pages;
 
-	compute_page_address(nccl_ofi_mr_ckey_baseaddr(ckey),
+	nccl_ofi_mr_compute_page_address(nccl_ofi_mr_ckey_baseaddr(ckey),
 			     nccl_ofi_mr_ckey_len(ckey),
 			     (uintptr_t)cache->system_page_size,
 			     &page_addr,
@@ -152,7 +142,7 @@ int nccl_ofi_mr_cache_insert_entry(nccl_ofi_mr_cache_t *cache,
 	size_t pages;
 	int ret = 0;
 
-	compute_page_address((uintptr_t)nccl_ofi_mr_ckey_baseaddr(ckey),
+	nccl_ofi_mr_compute_page_address((uintptr_t)nccl_ofi_mr_ckey_baseaddr(ckey),
 	                     nccl_ofi_mr_ckey_len(ckey),
 	                     (uintptr_t)cache->system_page_size,
 	                     &page_addr,

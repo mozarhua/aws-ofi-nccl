@@ -7,6 +7,8 @@
 #include "test-common.h"
 
 #define PROC_NAME_IDX(i) (i * MPI_MAX_PROCESSOR_NAME)
+#define NUM_SEND_BUF_SIZES (sizeof(send_sizes) / sizeof(send_sizes[0]))
+#define NUM_RECV_BUF_SIZES (sizeof(recv_sizes) / sizeof(recv_sizes[0]))
 
 int main(int argc, char *argv[])
 {
@@ -41,6 +43,13 @@ int main(int argc, char *argv[])
 	char *expected_buf = NULL;
 	int done, received_size;
 
+	/* Data sizes. We want to check send size much smaller
+	   and larger than system page size (currently 4k).
+	 */
+	size_t send_sizes[] = {512, SEND_SIZE_MAX};
+	size_t recv_sizes[] = {512, RECV_SIZE_MAX};
+	assert((NUM_SEND_BUF_SIZES == NUM_RECV_BUF_SIZES) && (NUM_SEND_BUF_SIZES % NUM_REQUESTS == 0));
+
 	/* Indicates if NICs support GPUDirect */
 	int *test_support_gdr = NULL;
 
@@ -56,11 +65,6 @@ int main(int argc, char *argv[])
 		NCCL_OFI_WARN("Failed to allocate memory");
 		res = ncclInternalError;
 		goto exit;
-	}
-
-	for (int recv_n = 0; recv_n < nrecv; recv_n++) {
-		sizes[recv_n] = RECV_SIZE;
-		tags[recv_n] = tag;
 	}
 
 	/* Start up MPI */
@@ -100,8 +104,8 @@ int main(int argc, char *argv[])
 	NCCL_OFI_TRACE(NCCL_NET, "Using CUDA device %d for memory allocation", local_rank);
 
 	/* Allocate and populate expected buffer */
-	OFINCCLCHECKGOTO(allocate_buff((void **)&expected_buf, SEND_SIZE, NCCL_PTR_HOST), res, exit);
-	OFINCCLCHECKGOTO(initialize_buff((void *)expected_buf, SEND_SIZE, NCCL_PTR_HOST), res, exit);
+	OFINCCLCHECKGOTO(allocate_buff((void **)&expected_buf, SEND_SIZE_MAX, NCCL_PTR_HOST), res, exit);
+	OFINCCLCHECKGOTO(initialize_buff((void *)expected_buf, SEND_SIZE_MAX, NCCL_PTR_HOST), res, exit);
 
 	/*
 	 * Calculate the rank of the next process in the ring.  Use the
@@ -199,15 +203,19 @@ int main(int argc, char *argv[])
 		/* Send NUM_REQUESTS to next rank */
 		NCCL_OFI_INFO(NCCL_NET, "Sending %d requests to rank %d", NUM_REQUESTS, next);
 		for (int idx = 0; idx < NUM_REQUESTS; idx++) {
-			OFINCCLCHECKGOTO(allocate_buff((void **)&send_buf[idx], SEND_SIZE, buffer_type), res, exit);
-			OFINCCLCHECKGOTO(initialize_buff((void *)send_buf[idx], SEND_SIZE, buffer_type), res, exit);
+			size_t szidx =  idx / (NUM_REQUESTS / NUM_SEND_BUF_SIZES);
+			OFINCCLCHECKGOTO(allocate_buff((void **)&send_buf[idx], send_sizes[szidx], buffer_type), res, exit);
+			OFINCCLCHECKGOTO(initialize_buff((void *)send_buf[idx], send_sizes[szidx], buffer_type), res, exit);
 
-			OFINCCLCHECKGOTO(extNet->regMr((void *)sComm_next, (void *)send_buf[idx], SEND_SIZE,
+			OFINCCLCHECKGOTO(extNet->regMr((void *)sComm_next, (void *)send_buf[idx], send_sizes[szidx],
 					buffer_type, &send_mhandle[idx]), res, exit);
-			NCCL_OFI_TRACE(NCCL_NET, "Successfully registered send memory for request %d of rank %d", idx, rank);
+			NCCL_OFI_TRACE(NCCL_NET, "Successfully registered send memory for request %d of rank %d, handle: %p, buffer: %p, size: %ld",
+				       idx, rank, send_mhandle[idx], send_buf[idx], send_sizes[szidx]);
 
 			while (send_req[idx] == NULL) {
-				OFINCCLCHECKGOTO(extNet->isend((void *)sComm_next, (void *)send_buf[idx], SEND_SIZE, tag,
+				NCCL_OFI_TRACE(NCCL_NET, "Try isend for request %d of rank %d, handle: %p, buffer: %p, size: %ld",
+					       idx, rank, send_mhandle[idx], send_buf[idx], send_sizes[szidx]);
+				OFINCCLCHECKGOTO(extNet->isend((void *)sComm_next, (void *)send_buf[idx], send_sizes[szidx], tag,
 						send_mhandle[idx], (void **)&send_req[idx]), res, exit);
 			}
 		}
@@ -215,8 +223,14 @@ int main(int argc, char *argv[])
 		/* Receive NUM_REQUESTS from prev rank */
 		NCCL_OFI_INFO(NCCL_NET, "Rank %d posting %d receive buffers", rank, NUM_REQUESTS);
 		for (int idx = 0; idx < NUM_REQUESTS; idx++) {
-			OFINCCLCHECKGOTO(allocate_buff((void **)&recv_buf[idx], RECV_SIZE, buffer_type), res, exit);
-			OFINCCLCHECKGOTO(extNet->regMr((void *)rComm, (void *)recv_buf[idx], RECV_SIZE,
+			size_t szidx =  idx / (NUM_REQUESTS / NUM_RECV_BUF_SIZES);
+			for (int recv_n = 0; recv_n < nrecv; recv_n++) {
+				sizes[recv_n] = recv_sizes[szidx];
+				tags[recv_n] = tag;
+			}
+
+			OFINCCLCHECKGOTO(allocate_buff((void **)&recv_buf[idx], recv_sizes[szidx], buffer_type), res, exit);
+			OFINCCLCHECKGOTO(extNet->regMr((void *)rComm, (void *)recv_buf[idx], recv_sizes[szidx],
 					buffer_type, &recv_mhandle[idx]), res, exit);
 			NCCL_OFI_TRACE(NCCL_NET, "Successfully registered receive memory for request %d of rank %d", idx, rank);
 
@@ -271,8 +285,10 @@ int main(int argc, char *argv[])
 
 					if ((buffer_type == NCCL_PTR_CUDA) && !ofi_nccl_gdr_flush_disable()) {
 						/* Data validation may fail if flush operations are disabled */
-					} else
-						OFINCCLCHECKGOTO(validate_data(recv_buf[idx], expected_buf, SEND_SIZE, buffer_type), res, exit);
+					} else {
+						size_t szidx =  idx / (NUM_REQUESTS / NUM_SEND_BUF_SIZES);
+						OFINCCLCHECKGOTO(validate_data(recv_buf[idx], expected_buf, send_sizes[szidx], buffer_type), res, exit);
+					}
 
 					/* Deregister memory handle */
 					OFINCCLCHECKGOTO(extNet->deregMr((void *)rComm, recv_mhandle[idx]), res, exit);

@@ -27,8 +27,8 @@
 #define STR(v)		STR2(v)
 
 #define NUM_REQUESTS	(NCCL_NET_MAX_REQUESTS)
-#define SEND_SIZE	(5000)
-#define RECV_SIZE	(5200)
+#define SEND_SIZE_MAX	(5000)
+#define RECV_SIZE_MAX	(5200)
 
 #define OFINCCLCHECK(call)                                                \
 	do {                                                              \

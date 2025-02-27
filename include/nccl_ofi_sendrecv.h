@@ -191,7 +191,7 @@ typedef struct nccl_net_ofi_sendrecv_req {
 	nccl_net_ofi_comm_t *comm;
 
 	/* Associated OFI Context */
-	struct fi_context ctx[2];
+	nccl_net_ofi_context_t ctx;
 
 	/* Associated Device ID */
 	int dev_id;

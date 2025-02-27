@@ -164,6 +164,14 @@ struct nccl_net_ofi_req {
 	int (*test)(nccl_net_ofi_req_t *req, int *done, int *size);
 };
 
+struct nccl_net_ofi_context {
+	struct fi_context2 ctx;
+	int (*handle_cq_entry)(struct nccl_net_ofi_context *ctx, struct fi_cq_entry *cq_entry);
+	int (*handle_error_entry)(struct nccl_net_ofi_context *ctx, struct fid_cq *cq,
+				  struct fi_cq_err_entry *err_entry);
+};
+typedef struct nccl_net_ofi_context nccl_net_ofi_context_t;
+
 /* Various stages of connection establishment */
 typedef enum nccl_ofi_comm_stage {
 	COMM_CREATE_START = 0,

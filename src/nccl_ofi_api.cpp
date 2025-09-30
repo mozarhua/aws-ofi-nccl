@@ -633,7 +633,13 @@ ncclResult_t nccl_net_ofi_isend_v9(void* sendComm, void* data, size_t size,
 		return check_return(ncclInternalError);
 	}
 
+#if(PROF_ISEND & (PROF_TOTAL | PROF_BEFORE_PENDING_CQ))
+	plugin->isend_total->start_timer();
+#endif
 	int ret = send_comm->send(send_comm, data, size, tag, handle, base_req);
+#if(PROF_ISEND & (PROF_TOTAL | PROF_AFTER_SEND_RECV_PROG))
+	plugin->isend_total->stop_timer();
+#endif
 	return nccl_net_ofi_retval_translate_impl(ret);
 }
 
@@ -642,7 +648,14 @@ ncclResult_t nccl_net_ofi_isend_v10(void* sendComm, void* data, size_t size,
 					int tag, void* mhandle, void* phandle, void** request)
 {
 	// TODO: Add support for network profiling events via pHandles.
-	return nccl_net_ofi_isend_v9(sendComm, data, size, tag, mhandle, request);
+#if(PROF_ISEND & PROF_TOTAL)
+	//plugin->isend_total->start_timer();
+#endif
+	ncclResult_t ret = nccl_net_ofi_isend_v9(sendComm, data, size, tag, mhandle, request);
+#if(PROF_ISEND & PROF_TOTAL)
+	//plugin->isend_total->stop_timer();
+#endif
+	return ret;
 }
 
 
@@ -723,7 +736,14 @@ ncclResult_t nccl_net_ofi_irecv_v10(void* recvComm, int n, void** data, size_t* 
 				   void** mhandles, void** phandles, void** request)
 {
 	// TODO: Add support for network profiling events via pHandles.
-	return nccl_net_ofi_irecv_v9(recvComm, n, data, sizes, tags, mhandles, request);
+#if(PROF_IRECV & (PROF_TOTAL | PROF_BEFORE_PENDING_CQ))
+	plugin->irecv_total->start_timer();
+#endif
+	ncclResult_t ret = nccl_net_ofi_irecv_v9(recvComm, n, data, sizes, tags, mhandles, request);
+#if(PROF_IRECV & (PROF_TOTAL | PROF_AFTER_SEND_RECV_PROG))
+	plugin->irecv_total->stop_timer();
+#endif
+	return ret;
 }
 
 
@@ -734,8 +754,14 @@ ncclResult_t nccl_net_ofi_test_v2(void* req, int* done, int* size)
 		return check_return(ncclInternalError);
 	}
 
+#if(PROF_TEST & PROF_TEST_TOTAL)
+	plugin->test_total->start_timer();
+#endif
 	nccl_net_ofi_req_t *base_req = (nccl_net_ofi_req_t *)req;
 	int ret = base_req->test(base_req, done, size);
+#if(PROF_TEST & PROF_TEST_TOTAL)
+	plugin->test_total->stop_timer();
+#endif
 	return nccl_net_ofi_retval_translate_impl(ret);
 }
 

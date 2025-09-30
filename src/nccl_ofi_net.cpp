@@ -137,6 +137,7 @@ int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t **plugin_p)
 	nccl_net_ofi_device_t *device = NULL;
 	nccl_ofi_properties_t properties;
 	nccl_ofi_topo_t *topo = nullptr;
+	const std::chrono::nanoseconds ovh_150(150), ovh_90(90), ovh_30(30), ovh_0(0);
 
 	NCCL_OFI_INFO(NCCL_INIT | NCCL_NET, "Initializing " PACKAGE_STRING);
 
@@ -170,6 +171,7 @@ int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t **plugin_p)
 
 	/* configuration parameters */
 	cq_read_count = ofi_nccl_cq_read_count();
+	NCCL_OFI_WARN("cq_read_count: %ld", cq_read_count);
 
 	topo = nccl_ofi_topo_create();
 	if (!topo) {
@@ -356,6 +358,56 @@ int nccl_net_ofi_create_plugin(nccl_net_ofi_plugin_t **plugin_p)
 
 	env_manager::getInstance().update_environment(&environ);
 
+	/* Histogram init for profiling */
+	// Binner w/o new threading model
+	//static std::vector<size_t> total_bins = {0, 350, 450, 550, 650, 750, 850, 950, 1050, 1150, 1250, 1350, 1450, 2048};
+	// new threading model:
+	static std::vector<size_t> total_bins = {0, 50, 100, 200, 350, 400, 500, 550, 600, 650, 700, 800, 1024, 1050, 2048};	// total time
+#if(PROF_ISEND & PROF_TOTAL)
+	plugin->isend_total = new timer_histogram<histogram_custom_binner<size_t> >("isend() Total Duration", histogram_custom_binner<size_t>(total_bins), ovh_30);
+#elif(PROF_ISEND & PROF_BEFORE_PENDING_CQ)
+	plugin->isend_total = new timer_histogram<histogram_custom_binner<size_t> >("isend() before process_pending_cq()", histogram_custom_binner<size_t>(total_bins), ovh_30);
+#else
+	plugin->isend_total = new timer_histogram<histogram_custom_binner<size_t> >("isend() after send_progress()", histogram_custom_binner<size_t>(total_bins), ovh_30);
+#endif
+#if(PROF_IRECV & PROF_TOTAL)
+	plugin->irecv_total = new timer_histogram<histogram_custom_binner<size_t> >("irecv() Total Duration", histogram_custom_binner<size_t>(total_bins), ovh_30);
+#elif(PROF_IRECV & PROF_BEFORE_PENDING_CQ)
+	plugin->irecv_total = new timer_histogram<histogram_custom_binner<size_t> >("irecv() before process_pending_cq()", histogram_custom_binner<size_t>(total_bins), ovh_30);
+#else
+	plugin->irecv_total = new timer_histogram<histogram_custom_binner<size_t> >("irecv() after send_progress()", histogram_custom_binner<size_t>(total_bins), ovh_30);
+#endif
+	// old threading model:
+	//static std::vector<size_t> cq_bins = {0, 30, 60, 90, 120, 150, 180, 210, 300, 330, 360, 390, 1024, 2048};
+	// new threading model:
+	static std::vector<size_t> cq_bins = {0, 20, 40, 60, 80, 100, 120, 140, 180, 200, 220, 240, 260, 2048};
+	plugin->isend_libf_pending_cq = new timer_histogram<histogram_custom_binner<size_t> >("isend() Libfabric pending_cq Duration", histogram_custom_binner<size_t>(cq_bins), ovh_30);
+	plugin->irecv_libf_pending_cq = new timer_histogram<histogram_custom_binner<size_t> >("irecv() Libfabric pending_cq Duration", histogram_custom_binner<size_t>(cq_bins), ovh_30);
+	// old model:
+	//static std::vector<size_t> prog_bins = {0, 30, 60, 90, 120, 150, 180, 210, 300, 330, 360, 390, 1024, 2048};
+	// new model:
+	static std::vector<size_t> prog_bins = {0, 30, 60, 90, 120, 150, 180, 210, 300, 330, 360, 390, 1024, 2048};
+	plugin->isend_libf_send_prog = new timer_histogram<histogram_custom_binner<size_t> >("isend() Libfabric send_progress() Duration", histogram_custom_binner<size_t>(prog_bins), ovh_30);	// total_bins in old model
+	plugin->irecv_libf_recv_prog = new timer_histogram<histogram_custom_binner<size_t> >("irecv() Libfabric recv_progress() Duration", histogram_custom_binner<size_t>(prog_bins), ovh_30); // total_bins in old model
+	//static std::vector<size_t> test_bins = {0, 90, 120, 150, 180, 210, 300, 330, 360, 390, 420, 450, 1024, 2048};
+	static std::vector<size_t> test_bins = {0, 90, 100, 110, 120, 130, 140, 150, 180, 210, 240, 270, 300, 330, 360, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 900, 1024, 2048};
+	plugin->test_total = new timer_histogram<histogram_custom_binner<size_t> >("test() Total Duration", histogram_custom_binner<size_t>(test_bins), ovh_30);
+	plugin->test_libf = new timer_histogram<histogram_custom_binner<size_t> >("test() Libfabric Duration", histogram_custom_binner<size_t>(test_bins), ovh_30);
+
+	// Measure the histogram overhead
+	static std::vector<size_t> overhead_bins = {0, 25, 33, 40, 80, 87, 94, 100, 140, 147, 154, 160, 1024};
+	plugin->timer_overhead = new timer_histogram<histogram_custom_binner<size_t> >("Histogram Timer Overhead Duration", histogram_custom_binner<size_t>(overhead_bins), ovh_0);
+	plugin->timer_overhead2 = new timer_histogram<histogram_custom_binner<size_t> >("Histogram Timer Overhead2 Duration", histogram_custom_binner<size_t>(overhead_bins), ovh_0);
+	plugin->timer_overhead3 = new timer_histogram<histogram_custom_binner<size_t> >("Histogram Timer Overhead2 Duration", histogram_custom_binner<size_t>(overhead_bins), ovh_0);
+
+	for (int x = 0; x < 100; x++) {
+		plugin->timer_overhead->start_timer();
+		plugin->timer_overhead2->start_timer();
+		plugin->timer_overhead3->start_timer();
+		plugin->timer_overhead3->stop_timer();
+		plugin->timer_overhead2->stop_timer();
+		plugin->timer_overhead->stop_timer();
+	}
 	*plugin_p = plugin;
 
  exit:

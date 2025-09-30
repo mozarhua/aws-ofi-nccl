@@ -908,7 +908,7 @@ static inline nccl_net_ofi_sendrecv_req_t *sendrecv_allocate_req(nccl_ofi_freeli
 
 static int sendrecv_recv_comm_recv(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
 				   size_t *sizes, int *tags, nccl_net_ofi_mr_handle_t **mhandles,
-				   nccl_net_ofi_req_t **base_req)
+				   nccl_net_ofi_req_t **base_req) noexcept
 {
 	int ret = 0;
 	ssize_t rc = 0;
@@ -1725,7 +1725,7 @@ static int sendrecv_send_comm_dereg_mr(nccl_net_ofi_send_comm_t *send_comm,
 }
 
 static int sendrecv_send_comm_send(nccl_net_ofi_send_comm_t *send_comm, void *data, size_t size, int tag,
-				   nccl_net_ofi_mr_handle_t *mhandle, nccl_net_ofi_req_t **base_req)
+				   nccl_net_ofi_mr_handle_t *mhandle, nccl_net_ofi_req_t **base_req) noexcept
 {
 	int ret = 0;
 	nccl_net_ofi_sendrecv_send_comm_t *s_comm =

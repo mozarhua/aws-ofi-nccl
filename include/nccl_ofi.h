@@ -14,6 +14,7 @@
 #include <rdma/fi_tagged.h>
 #include <rdma/fi_rma.h>
 #include <nccl/net.h>
+#include <stats/histogram.h>
 
 #include "nccl_ofi_log.h"
 #include "nccl_ofi_topo.h"
@@ -809,7 +810,7 @@ struct nccl_net_ofi_send_comm {
 	int (*deregMr)(nccl_net_ofi_send_comm_t *send_comm, nccl_net_ofi_mr_handle_t *mhandle);
 
 	int (*send)(nccl_net_ofi_send_comm_t *send_comm, void *data, size_t size, int tag,
-			     nccl_net_ofi_mr_handle_t *mhandle, nccl_net_ofi_req_t **req);
+			     nccl_net_ofi_mr_handle_t *mhandle, nccl_net_ofi_req_t **req) noexcept;
 
 	int (*close)(nccl_net_ofi_send_comm_t *send_comm);
 
@@ -842,7 +843,7 @@ struct nccl_net_ofi_recv_comm {
 	int (*deregMr)(nccl_net_ofi_recv_comm_t *recv_comm, nccl_net_ofi_mr_handle_t *mhandle);
 
 	int (*recv)(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **data, size_t *sizes, int *tags,
-			     nccl_net_ofi_mr_handle_t **mhandles, nccl_net_ofi_req_t **req);
+			     nccl_net_ofi_mr_handle_t **mhandles, nccl_net_ofi_req_t **req) noexcept;
 
 	int (*flush)(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **data, int *sizes,
 			      nccl_net_ofi_mr_handle_t **mhandles, nccl_net_ofi_req_t **req);
@@ -941,6 +942,22 @@ public:
 					 int dev_id,
 					 int num_devices,
 					 nccl_ofi_properties_t *props);
+
+	/*
+	 * Histrograms to profile isend(), irecv(), and test().
+	 */
+	timer_histogram<histogram_custom_binner<size_t> > *isend_total;
+	timer_histogram<histogram_custom_binner<size_t> > *isend_libf_pending_cq;
+	timer_histogram<histogram_custom_binner<size_t> > *isend_libf_send_prog;
+	timer_histogram<histogram_custom_binner<size_t> > *irecv_total;
+	timer_histogram<histogram_custom_binner<size_t> > *irecv_libf_pending_cq;
+	timer_histogram<histogram_custom_binner<size_t> > *irecv_libf_recv_prog;
+	timer_histogram<histogram_custom_binner<size_t> > *test_total;
+	timer_histogram<histogram_custom_binner<size_t> > *test_libf;
+	timer_histogram<histogram_custom_binner<size_t> > *timer_overhead;
+	timer_histogram<histogram_custom_binner<size_t> > *timer_overhead2;
+	timer_histogram<histogram_custom_binner<size_t> > *timer_overhead3;
+
 protected:
 	/* Array of devices */
 	std::vector<nccl_net_ofi_device_t *> p_devs;

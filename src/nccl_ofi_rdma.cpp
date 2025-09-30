@@ -99,6 +99,7 @@
 #define COMM_READY_TO_DESTROY 1
 
 /** Global variables **/
+nccl_net_ofi_plugin_t *g_plugin = nullptr;
 
 /* List of comms undergoing deferred cleanup */
 static std::deque<nccl_net_ofi_rdma_send_comm_t*> *s_comm_cleanup_list = NULL;
@@ -2405,7 +2406,9 @@ static int test(nccl_net_ofi_req_t *base_req, int *done, int *size)
 			}
 		}
 #endif
+		g_plugin->test_libf->start_timer();	// estimation in the first round of profiling
 		ret = ep->ofi_process_cq();
+		g_plugin->test_libf->stop_timer();	// estimation in the first round of profiling
 		if (OFI_UNLIKELY(ret != 0))
 			goto exit;
 
@@ -3049,8 +3052,9 @@ static int recv(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
 
 	CHECK_DOMAIN_ACTIVE(domain, "recv");
 
-
+	g_plugin->irecv_libf_pending_cq->start_timer();
 	ret = ep->process_cq_if_pending();
+	g_plugin->irecv_libf_pending_cq->stop_timer();
 	if (ret == -EAGAIN) {
 		/* Network is still busy. Return NULL to NCCL. */
 		*base_req = NULL;
@@ -3159,7 +3163,9 @@ static int recv(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
 
 	/* Send ctrl msg */
 	r_comm->n_ctrl_sent += 1;
+	g_plugin->irecv_libf_recv_prog->start_timer();
 	ret = receive_progress(req, true);
+	g_plugin->irecv_libf_recv_prog->stop_timer();
 	if (OFI_UNLIKELY(ret != 0)) {
 		/* TODO: Remove req from message buffer */
 		goto error;
@@ -3196,6 +3202,7 @@ static int recv(nccl_net_ofi_recv_comm_t *recv_comm, int n, void **buffers,
 		req->free(req, false);
 	*base_req = NULL;
  exit:
+	//g_plugin->irecv_libf->stop_timer();
 	return ret;
 }
 
@@ -5176,6 +5183,7 @@ static int send_progress(nccl_net_ofi_rdma_req_t *req)
 
 			ret = post_rdma_eager_send(req, comm_rail, xfer_info);
 		} else {
+			//g_plugin->isend_libf->resume_timer();
 			for (uint16_t rail_it = send_data->xferred_rail_id; rail_it < schedule->num_xfer_infos; rail_it++) {
 				/* Get xfer information from the schedule */
 				nccl_net_ofi_xfer_info_t *xfer_info = &xfers[rail_it];
@@ -5190,6 +5198,7 @@ static int send_progress(nccl_net_ofi_rdma_req_t *req)
 				else
 					break;
 			}
+			//g_plugin->isend_libf->pause_timer();
 		}
 	} else if (req->type == NCCL_OFI_RDMA_WRITE) { // Post RMA write
 		ret = post_rma_write(req);
@@ -5274,11 +5283,13 @@ static int post_rdma_ctrl(nccl_net_ofi_rdma_req_t *req)
 	void *desc = fi_mr_desc(r_comm->ctrl_mr_handle->mr[rail_id]);
 	nccl_net_ofi_rdma_recv_comm_rail_t *comm_rail = rdma_recv_comm_get_control_rail(r_comm, rail_id);
 
+	//g_plugin->irecv_libf->resume_timer();
 	ssize_t rc = fi_write(comm_rail->local_ep, &r_comm->ctrl_mailbox[slot],
 			ctrl_msg_len, desc,
 			comm_rail->remote_addr,
 			r_comm->remote_mailbox_addr + slot * sizeof(nccl_net_ofi_ctrl_msg_t),
 			r_comm->remote_mr_key[rail_id], rdma_req_get_ofi_context(req, rail_id));
+	//g_plugin->irecv_libf->pause_timer();
 
 	if (rc == 0) {
 		NCCL_OFI_TRACE_WRITE_CTRL_START(req->dev_id,
@@ -5513,7 +5524,9 @@ static int send(nccl_net_ofi_send_comm_t *send_comm, void *data, size_t size, in
 
 	CHECK_DOMAIN_ACTIVE(domain, "send");
 
+	g_plugin->isend_libf_pending_cq->start_timer();
 	ret = ep->process_cq_if_pending();
+	g_plugin->isend_libf_pending_cq->pause_timer();
 	if (ret == -EAGAIN) {
 		/* Network is still busy. Return NULL to NCCL. */
 		*base_req = NULL;
@@ -5596,7 +5609,9 @@ static int send(nccl_net_ofi_send_comm_t *send_comm, void *data, size_t size, in
 	/* Try posting RDMA write for received RDMA control messages */
 	if (have_ctrl || eager) {
 
+		g_plugin->isend_libf_send_prog->start_timer();
 		ret = send_progress(req);
+		g_plugin->isend_libf_send_prog->stop_timer();
 		if (ret == -FI_EAGAIN) {
 			/* Add to pending reqs queue */
 			nccl_net_ofi_mutex_lock(&ep->pending_reqs_lock);
@@ -5623,6 +5638,7 @@ static int send(nccl_net_ofi_send_comm_t *send_comm, void *data, size_t size, in
 		req->free(req, false);
 	*base_req = NULL;
  exit:
+	//g_plugin->isend_libf->stop_timer();
 	return ret;
 }
 
@@ -6959,16 +6975,24 @@ static void get_hints(struct fi_info *hints)
 	hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR |
 		FI_MR_ALLOCATED | FI_MR_PROV_KEY;
 	hints->domain_attr->mr_key_size = (size_t) ofi_nccl_mr_key_size();
-	hints->domain_attr->threading = FI_THREAD_SAFE;
+	//hints->domain_attr->threading = FI_THREAD_SAFE;
+	hints->domain_attr->threading = FI_THREAD_COMPLETION;
 
 	/* We hard poll for completion, but if a provider is faster with async
 	 * progress, then we don't really care and should let it do that. At
 	 * least one provider has an issue with progress manual and internal
 	 * acks during shutdown, so allow users to override requested model. */
-	hints->domain_attr->control_progress = nccl_ofi_translate_progress_enum(ofi_nccl_progress_model.get());
+	//hints->domain_attr->control_progress = nccl_ofi_translate_progress_enum(ofi_nccl_progress_model.get());
+	hints->domain_attr->control_progress = FI_PROGRESS_CONTROL_UNIFIED;
 	hints->domain_attr->data_progress = nccl_ofi_translate_progress_enum(ofi_nccl_progress_model.get());
 }
 
+static void print_and_free_histogram(timer_histogram<histogram_custom_binner<size_t> > **hist)
+{
+	(*hist)->print_stats();
+	delete (*hist);
+	(*hist) = nullptr;
+}
 
 nccl_net_ofi_rdma_plugin_t::~nccl_net_ofi_rdma_plugin_t()
 {
@@ -6985,6 +7009,23 @@ nccl_net_ofi_rdma_plugin_t::~nccl_net_ofi_rdma_plugin_t()
 	if (s_comm_cleanup_list != nullptr) {
 		delete s_comm_cleanup_list;
 		s_comm_cleanup_list = nullptr;
+	}
+
+	if (this->isend_total) {
+		print_and_free_histogram(&this->isend_total);
+		print_and_free_histogram(&this->isend_libf_pending_cq);
+		print_and_free_histogram(&this->isend_libf_send_prog);
+
+		print_and_free_histogram(&this->irecv_total);
+		print_and_free_histogram(&this->irecv_libf_pending_cq);
+		print_and_free_histogram(&this->irecv_libf_recv_prog);
+
+		print_and_free_histogram(&this->test_total);
+		print_and_free_histogram(&this->test_libf);
+
+		print_and_free_histogram(&this->timer_overhead);
+		print_and_free_histogram(&this->timer_overhead2);
+		print_and_free_histogram(&this->timer_overhead3);
 	}
 
 	delete(flush_sentinel);
@@ -7211,6 +7252,7 @@ int nccl_net_ofi_rdma_init(const char *provider_filter,
 	}
 
 	plugin = new nccl_net_ofi_rdma_plugin_t(provider_list);
+	g_plugin = plugin;
 
 	/**
 	 * NCCL's topology detection will set NIC PCIe link speed based on the

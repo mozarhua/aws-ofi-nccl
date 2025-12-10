@@ -147,6 +147,7 @@ protected:
 #define PROF_SEND_RECV_PROG	0x8
 #define PROF_AFTER_SEND_RECV_PROG	0x10
 #define PROF_FI_WRITE		0x20
+#define PROF_MUTEX		0x40
 
 // Test sub category
 #define PROF_TEST_TOTAL		0x0
@@ -176,8 +177,8 @@ protected:
 */
 
 // Alternating following to do different profiling every time.
-#define PROF_ISEND	(PROF_ISEND_BASE | PROF_FI_WRITE)
-#define PROF_IRECV	(PROF_IRECV_BASE | PROF_FI_WRITE)
+#define PROF_ISEND	(PROF_ISEND_BASE | PROF_MUTEX)
+#define PROF_IRECV	(PROF_IRECV_BASE | PROF_AFTER_SEND_RECV_PROG)
 #define PROF_TEST	(PROF_TEST_BASE | PROF_TEST_FI_CQ_READ)
 
 #endif

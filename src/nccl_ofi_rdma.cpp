@@ -5735,7 +5735,11 @@ static int send(nccl_net_ofi_send_comm_t *send_comm, void *data, size_t size, in
 	domain = ep->rdma_endpoint_get_domain();
 	assert(domain != NULL);
 
+#if(PROF_ISEND & PROF_MUTEX)
+	pthread_wrapper_prof eplock(ENDPOINT_LOCK(ep), g_plugin->isend_total);
+#else
 	pthread_wrapper eplock(ENDPOINT_LOCK(ep));
+#endif
 
 	CHECK_ENDPOINT_ACTIVE(ep, "send");
 
@@ -5855,9 +5859,10 @@ static int send(nccl_net_ofi_send_comm_t *send_comm, void *data, size_t size, in
 			goto error;
 		}
 	}
-#if(PROF_ISEND & PROF_AFTER_SEND_RECV_PROG)
-	g_plugin->isend_total->start_timer();
-#endif
+// Dec 09 commented out initial measurement which obtained 270ns.
+//#if(PROF_ISEND & PROF_AFTER_SEND_RECV_PROG)
+//	g_plugin->isend_total->start_timer();
+//#endif
 	/* Return request to NCCL */
 	*base_req = &req->base;
 	/* Increment next_msg_seq_num for next call */
@@ -5870,7 +5875,9 @@ static int send(nccl_net_ofi_send_comm_t *send_comm, void *data, size_t size, in
 		req->free(req, false);
 	*base_req = NULL;
  exit:
-	//g_plugin->isend_libf->stop_timer();
+#if(PROF_ISEND & PROF_AFTER_SEND_RECV_PROG)
+	g_plugin->isend_total->start_timer();	// Dec 09 try to narrow down 270ns
+#endif
 	return ret;
 }
 
@@ -7300,7 +7307,7 @@ nccl_net_ofi_rdma_plugin_t::~nccl_net_ofi_rdma_plugin_t()
 
 	if (this->isend_total) {
 		NCCL_OFI_WARN("NCCLOFI-1149 profile type: 0x%x, 0x%x, 0x%x", PROF_ISEND, PROF_IRECV, PROF_TEST);
-#if(PROF_ISEND & (PROF_TOTAL | PROF_BEFORE_PENDING_CQ | PROF_AFTER_SEND_RECV_PROG))
+#if(PROF_ISEND & (PROF_TOTAL | PROF_BEFORE_PENDING_CQ | PROF_AFTER_SEND_RECV_PROG | PROF_MUTEX))
 		print_and_free_histogram(&this->isend_total);
 #endif
 #if(PROF_ISEND & (PROF_PENDING_CQ | PROF_REQ_PREP))

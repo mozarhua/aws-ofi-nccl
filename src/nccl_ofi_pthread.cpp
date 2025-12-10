@@ -13,7 +13,7 @@
 
 static pthread_once_t errorcheck_once = PTHREAD_ONCE_INIT;
 static pthread_mutexattr_t errorcheck_attr;
-
+static pthread_mutexattr_t recursive_attr;  // prof test
 
 static void errorcheck_init(void)
 {
@@ -30,6 +30,18 @@ static void errorcheck_init(void)
 		NCCL_OFI_WARN("pthread_once failed: %s", strerror(ret));
 		abort();
 	}
+
+	ret = pthread_mutexattr_init(&recursive_attr);
+	if (ret != 0) {
+		NCCL_OFI_WARN("pthread_once failed: %s", strerror(ret));
+		abort();
+	}
+
+	ret = pthread_mutexattr_settype(&recursive_attr, PTHREAD_MUTEX_RECURSIVE);
+	if (ret != 0) {
+		NCCL_OFI_WARN("pthread_once failed: %s", strerror(ret));
+		abort();
+	}
 }
 
 
@@ -40,6 +52,7 @@ nccl_net_ofi_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr)
 	const pthread_mutexattr_t *passed_attr;
 
 	int want_errorcheck = ofi_nccl_errorcheck_mutex();
+	want_errorcheck = false;
 
 	ret = pthread_once(&errorcheck_once, errorcheck_init);
 	if (ret != 0) {
@@ -49,9 +62,12 @@ nccl_net_ofi_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr)
 
 	if (attr != NULL || want_errorcheck == 0) {
 		passed_attr = attr;
+		NCCL_OFI_WARN("Using default on mutex");
 	} else {
-		NCCL_OFI_TRACE(NCCL_NET, "Enabling error checking on mutex");
-		passed_attr = &errorcheck_attr;
+		//NCCL_OFI_TRACE(NCCL_NET, "Enabling error checking on mutex");
+		//passed_attr = &errorcheck_attr;
+		NCCL_OFI_WARN("Enabling recursive on mutex");
+		passed_attr = &recursive_attr;	// prof test
 	}
 
 	ret = pthread_mutex_init(mutex, passed_attr);

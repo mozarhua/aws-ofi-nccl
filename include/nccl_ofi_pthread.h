@@ -142,5 +142,62 @@ private:
 	pthread_mutex_t *mutex;
 };
 
+#include "stats/histogram.h"
+/* A copy of nccl_net_ofi_mutex_unlock_impl() for profiling only */
+static inline void
+nccl_net_ofi_mutex_unlock_impl_prof(pthread_mutex_t *mutex,
+				    timer_histogram<histogram_custom_binner<size_t> > *timer,
+				    const char *file, size_t line)
+{
+#if(PROF_ISEND & PROF_MUTEX)
+	timer->start_timer();   // Dec 09 narrow down 270ns
+#endif
+	int ret = pthread_mutex_unlock(mutex);
+#if(PROF_ISEND & PROF_MUTEX)
+	timer->stop_timer();   // Dec 09 narrow down 270ns
+#endif
+	if (OFI_UNLIKELY(ret != 0)) {
+		(*ofi_log_function)(NCCL_LOG_WARN, NCCL_ALL, file, line,
+				    "NET/OFI pthread_mutex_unlock failed: %s",
+				    strerror(ret));
+		abort();
+	}
+}
+#define nccl_net_ofi_mutex_unlock_prof(mutex, timer) nccl_net_ofi_mutex_unlock_impl_prof(mutex, timer, __FILE__, __LINE__);
+
+class pthread_wrapper_prof {
+public:
+	/**
+	 * Constructor. Take ownership of the mutex and lock it.
+	 */
+	pthread_wrapper_prof(pthread_mutex_t *_mutex, timer_histogram<histogram_custom_binner<size_t> > *_timer) : mutex(_mutex), timer(_timer)
+	{
+		nccl_net_ofi_mutex_lock(mutex);
+	}
+
+	/**
+	 * Manually unlock the mutex. After this function is called, the mutex
+	 * is no longer owned by this class.
+	 */
+	void unlock()
+	{
+		assert(mutex);
+		nccl_net_ofi_mutex_unlock(mutex);
+		mutex = nullptr;
+	}
+
+	/**
+	 * Destructor. Unlock the owned mutex.
+	 */
+	~pthread_wrapper_prof()
+	{
+		if (mutex) {
+			nccl_net_ofi_mutex_unlock_prof(mutex, timer);
+		}
+	}
+private:
+	pthread_mutex_t *mutex;
+	timer_histogram<histogram_custom_binner<size_t> > *timer;
+};
 
 #endif // End NCCL_OFI_PTHREAD_H

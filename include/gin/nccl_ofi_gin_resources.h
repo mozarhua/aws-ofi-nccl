@@ -43,6 +43,9 @@ struct nccl_ofi_gin_ep_rail_t {
 	ofi_ep_ptr ofi_ep;
 };
 
+/* Forward declaration for profiling comm pointer in EP */
+class nccl_ofi_gin_comm;
+
 /**
  * The GIN endpoint type
  */
@@ -91,9 +94,10 @@ public:
 	/**
 	 * Process completions for all rails
 	 *
+	 * @param num_cq_entries: if non-null, incremented by the number of CQ entries processed
 	 * @return: 0 or -errno for error
 	 */
-	int process_cq();
+	int process_cq(int *num_cq_entries = nullptr);
 
 	/**
 	 * Close Libfabric endpoint object. For non-endpoint-MR providers, this
@@ -103,8 +107,13 @@ public:
 
 	std::mutex ep_lock;
 
+	void set_profile_comm(nccl_ofi_gin_comm *comm) { profile_comm = comm; }
+	nccl_ofi_gin_comm *get_profile_comm() const { return profile_comm; }
+
 private:
 	nccl_net_ofi_domain_t &domain;
+
+	nccl_ofi_gin_comm *profile_comm = nullptr;
 
 	uint16_t num_rails;
 
@@ -126,7 +135,7 @@ private:
 	/**
 	 * Process all completions for the given rail
 	 */
-	int gin_process_cq_rail(uint16_t rail_id);
+	int gin_process_cq_rail(uint16_t rail_id, int *num_cq_entries = nullptr);
 };
 
 /**
@@ -313,8 +322,10 @@ public:
 
 	/**
 	 * Progress completion queue and retry any pending requests
+	 *
+	 * @param num_cq_entries: if non-null, incremented by the number of CQ entries processed
 	 */
-	int progress();
+	int progress(int *num_cq_entries = nullptr);
 
 	/**
 	 * Called when a new communicator is associated with this resource object

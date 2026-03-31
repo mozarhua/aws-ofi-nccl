@@ -6,6 +6,7 @@
 
 #include "gin/nccl_ofi_gin.h"
 
+#include <algorithm>
 #include "nccl_ofi_assert.h"
 #include "nccl_ofi_gdrcopy.h"
 #include "nccl_ofi_tracepoint.h"
@@ -61,10 +62,56 @@ nccl_ofi_gin_comm::nccl_ofi_gin_comm(nccl_ofi_gin_resources &resources_arg, int 
 
 	resources.set_comm(local_comm_id, *this);
 	resources.increment_ref_cnt();
+	/* Pin this comm as the EP's profiling target (first-comm-wins) */
+	if (!resources.get_ep().get_profile_comm())
+		resources.get_ep().set_profile_comm(this);
+	nccl_ofi_gin_all_comms.push_back(this);
+
+	/* Calibrate timer overhead at init */
+	static std::vector<size_t> ovh_bins = {0, 25, 33, 40, 80, 87, 94, 100, 140, 147, 154, 160, 1024};
+	static const std::chrono::nanoseconds ovh_0(0);
+	hist_timer_overhead = new gin_histogram_t("Timer Overhead", histogram_custom_binner<size_t>(ovh_bins), ovh_0);
+	hist_timer_overhead2 = new gin_histogram_t("Timer Overhead2", histogram_custom_binner<size_t>(ovh_bins), ovh_0);
+	hist_timer_overhead3 = new gin_histogram_t("Timer Overhead3", histogram_custom_binner<size_t>(ovh_bins), ovh_0);
+	for (int x = 0; x < 100; x++) {
+		hist_timer_overhead->start_timer();
+		hist_timer_overhead2->start_timer();
+		hist_timer_overhead3->start_timer();
+		hist_timer_overhead3->stop_timer();
+		hist_timer_overhead2->stop_timer();
+		hist_timer_overhead->stop_timer();
+	}
 }
 
 nccl_ofi_gin_comm::~nccl_ofi_gin_comm()
 {
+	nccl_ofi_gin_all_comms.erase(
+		std::remove(nccl_ofi_gin_all_comms.begin(), nccl_ofi_gin_all_comms.end(), this),
+		nccl_ofi_gin_all_comms.end());
+	if (hist_test) {
+		hist_test->print_stats();
+		delete hist_test;
+	}
+	if (hist_iput_signal) {
+		hist_iput_signal->print_stats();
+		delete hist_iput_signal;
+	}
+	if (hist_progress) {
+		hist_progress->print_stats();
+		delete hist_progress;
+	}
+	if (hist_timer_overhead) {
+		hist_timer_overhead->print_stats();
+		delete hist_timer_overhead;
+	}
+	if (hist_timer_overhead2) {
+		hist_timer_overhead2->print_stats();
+		delete hist_timer_overhead2;
+	}
+	if (hist_timer_overhead3) {
+		hist_timer_overhead3->print_stats();
+		delete hist_timer_overhead3;
+	}
 #if HAVE_NVTX_TRACING
 	if (ofi_nccl_nvtx_trace_dimension() == NVTX_TRACE_DIMENSION::PER_COMM) {
 		for (int i = 0; i < NCCL_OFI_N_NVTX_DOMAIN_PER_COMM; ++i) {
@@ -201,6 +248,7 @@ int nccl_ofi_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[], int
 	}
 
 	(*gin_comm_out) = gin_comm;
+	NCCL_OFI_WARN("Connected: ep: %p, gin_comm: %p", ep, gin_comm);
 	return 0;
 }
 
@@ -307,6 +355,8 @@ int nccl_ofi_gin_comm::regMrSymDmaBuf(nccl_ofi_mr_ckey_ref ckey, void *data_ptr,
 			delete mr_handle;
 			return ret;
 		}
+		/* Initialize signal shadow array (one entry per uint64_t in the region) */
+		mr_handle->signal_shadow.resize(mr_handle->size / sizeof(uint64_t), 0);
 	}
 
 	auto *local_handle = mr_handle->local_handle;
@@ -389,6 +439,11 @@ int nccl_ofi_gin_comm::iputSignal(uint64_t srcOff, gin_sym_mr_handle *srcMhandle
 				  uint64_t signalValue, uint32_t signalOp,
 				  nccl_net_ofi_gin_iputsignal_req_t **request)
 {
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_E2E)
+	int rec = histogram_recording;
+	if (rec && hist_iput_signal)
+		hist_iput_signal->start_timer();
+#endif
 	if (signalOp != 0 && signalOp != NCCL_NET_SIGNAL_OP_INC &&
 	    signalOp != NCCL_NET_SIGNAL_OP_ADD) {
 		NCCL_OFI_WARN("Only support signal add/increment");
@@ -556,6 +611,10 @@ int nccl_ofi_gin_comm::iputSignal(uint64_t srcOff, gin_sym_mr_handle *srcMhandle
 	rank_comm.next_target_seq_num = (rank_comm.next_target_seq_num + 1) & GIN_IMM_SEQ_MASK;
 
 	*request = req;
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_E2E)
+	if (rec && hist_iput_signal)
+		hist_iput_signal->stop_timer();
+#endif
 	return 0;
 }
 
@@ -591,21 +650,12 @@ int nccl_ofi_gin_comm::do_gin_signal(const nccl_net_ofi_gin_signal_metadata_msg_
 	gin_sym_mr_handle *mr_handle = it->second;
 
 	if (mr_handle->type == NCCL_PTR_CUDA) {
-		uint64_t old_value;
-
-		int ret = get_device_copy().copy_from_device(*mr_handle->gdr_handle,
-							     metadata.signal_offset, &old_value,
-							     sizeof(old_value));
-		if (OFI_UNLIKELY(ret != 0)) {
-			NCCL_OFI_WARN("Failed to read current signal value");
-			return -ret;
-		}
-
-		/* We only support addition */
-		uint64_t new_value = old_value + add_value;
+		uint64_t idx = metadata.signal_offset / sizeof(uint64_t);
+		uint64_t new_value = mr_handle->signal_shadow[idx] + add_value;
+		mr_handle->signal_shadow[idx] = new_value;
 
 		/* Write using GDRcopy. */
-		ret = get_device_copy().copy_to_device(&new_value, *mr_handle->gdr_handle,
+		int ret = get_device_copy().copy_to_device(&new_value, *mr_handle->gdr_handle,
 						       metadata.signal_offset, sizeof(new_value));
 		if (OFI_UNLIKELY(ret != 0)) {
 			NCCL_OFI_WARN("Failed to update signal value");
@@ -641,11 +691,21 @@ int nccl_ofi_gin_comm::iput_signal_recv_req_completion(uint32_t peer_rank, uint6
 		       req->metadata.msg_seq_num);
 
 	if (req->metadata_received) {
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SIGNAL)
+		if (histogram_recording && hist_progress) {
+			hist_progress->start_timer();
+		}
+#endif
 		NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_BEGIN(dev, this, peer_rank,
 							 req->metadata.msg_seq_num, req);
 		ret = do_gin_signal(req->metadata);
 		NCCL_OFI_TRACE_GIN_SIGNAL_DELIVERY_END(dev, this, peer_rank,
 						       req->metadata.msg_seq_num, req);
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SIGNAL)
+		if (histogram_recording && hist_progress) {
+			hist_progress->stop_timer();
+		}
+#endif
 	}
 
 	if (ret != 0) {
@@ -711,7 +771,19 @@ int nccl_ofi_gin_comm::iput_signal_deliver_all(uint32_t peer_rank)
 				rank_comm.next_delivered_signal_seq_num =
 					(rank_comm.next_delivered_signal_seq_num + 1) &
 					GIN_IMM_SEQ_MASK;
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SIGNAL)
+				// Potentailly two peaks and need to adjust the binner.
+				//if (histogram_recording && hist_progress) {
+				//	hist_progress->start_timer();
+				//}
+#endif
 				ret = iput_signal_recv_req_completion(peer_rank, map_key, req);
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SIGNAL)
+				// Potentailly two peaks and need to adjust the binner.
+				//if (histogram_recording && hist_progress) {
+				//	hist_progress->stop_timer();
+				//}
+#endif
 				if (OFI_UNLIKELY(ret != 0)) {
 					NCCL_OFI_WARN("Failed to complete signal seq_num %hu",
 						      next_seq_num);
@@ -770,8 +842,26 @@ int nccl_ofi_gin_comm::handle_signal_metadata_completion(
 		req->num_seg_completions += 1;
 	}
 	NCCL_OFI_TRACE_GIN_RECV_METADATA(dev, rail_id, this, peer_rank, msg_seq_num, req);
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_NON_ACK)
+	auto *gin_comm2 = resources.get_ep().get_profile_comm();
+	if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+		gin_comm2->hist_progress->stop_timer();
+	}
+#endif
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SEND_ACK)
+	// Potentailly two peaks and need to adjust the binner.
+	if (histogram_recording && hist_progress) {
+		hist_progress->start_timer();
+	}
+#endif
 	ret = iput_signal_deliver_all(peer_rank);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SEND_ACK)
+	// Potentailly two peaks and need to adjust the binner.
+	if (histogram_recording && hist_progress) {
+		hist_progress->stop_timer();
+	}
+#endif
 	return ret;
 }
 
@@ -838,7 +928,26 @@ int nccl_ofi_gin_comm::handle_signal_write_completion(fi_addr_t src_addr, uint16
 		req->metadata.msg_type = GIN_MSG_TYPE_METADATA;
 	}
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_NON_ACK)
+	auto *gin_comm2 = resources.get_ep().get_profile_comm();
+	if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+		gin_comm2->hist_progress->stop_timer();
+	}
+#endif
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SEND_ACK)
+	// Potentailly two peaks and need to adjust the binner.
+	if (histogram_recording && hist_progress) {
+		hist_progress->start_timer();
+	}
+#endif
 	ret = iput_signal_deliver_all(peer_rank);
+
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SEND_ACK)
+	// Potentailly two peaks and need to adjust the binner.
+	if (histogram_recording && hist_progress) {
+		hist_progress->stop_timer();
+	}
+#endif
 
 	return ret;
 }

@@ -25,7 +25,7 @@ poll_request_completion(ncclGin_v11_t *extGin, std::deque<void *> &request_deque
 		 * test by ensuring each rank calls `ginProgress` until the barrier
 		 * before verification is reached.
 		 */
-		OFINCCLCHECK(extGin->ginProgress(collComm));
+		OFINCCLCHECK(extGin->ginProgress(collComm, nullptr));
 	}
 	return ncclSuccess;
 }
@@ -252,7 +252,7 @@ int main(int argc, char *argv[])
 		/* Validate that the signal_buff reaches the designated signal value */
 		uint64_t signal_h = 0;
 		while (signal_h != NUM_REQS_PER_PEER) {
-			OFINCCLCHECK(extGin->ginProgress(collComm));
+			OFINCCLCHECK(extGin->ginProgress(collComm, nullptr));
 			CUDACHECK(cudaMemcpy(&signal_h, signal_buf, sizeof(uint64_t),
 					     cudaMemcpyDefault));
 		}
@@ -263,7 +263,7 @@ int main(int argc, char *argv[])
 	int barrier_done = 0;
 	while (!barrier_done) {
 		/* Make progress on comm until all ranks reach the barrier */
-		OFINCCLCHECK(extGin->ginProgress(collComm));
+		OFINCCLCHECK(extGin->ginProgress(collComm, nullptr));
 		MPI_Test(&barrier_req, &barrier_done, MPI_STATUS_IGNORE);
 	}
 

@@ -6,6 +6,7 @@
 
 #include <cstring>
 
+#include <vector>
 #include "rdma/gin/nccl_ofi_gin.h"
 #include "rdma/gin/nccl_ofi_gin_types.h"
 #include "rdma/gin/nccl_ofi_gin_gdaki.h"
@@ -257,10 +258,22 @@ ncclResult_t nccl_ofi_gin_deregMrSym(void *collComm, void *mhandle)
 	return ncclSuccess;
 }
 
-ncclResult_t nccl_ofi_gin_ginProgress(void *collComm)
+ncclResult_t nccl_ofi_gin_ginProgress(void *collComm, int *num_cq_entries)
 {
 	auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(collComm);
-	int ret = gin_comm->get_resources().progress();
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_E2E)
+	int rec = gin_comm->histogram_recording;
+	if (rec && gin_comm->hist_progress) {
+		gin_comm->hist_progress->start_timer();
+	}
+#endif
+	int ret = gin_comm->get_resources().progress(num_cq_entries);
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_E2E)
+	if (rec && gin_comm->hist_progress) {
+		int n = (num_cq_entries) ? *num_cq_entries : 0;
+		gin_comm->hist_progress->stop_timer(n);
+	}
+#endif
 	if (OFI_UNLIKELY(ret != 0)) {
 		return nccl_net_ofi_retval_translate(ret);
 	}
@@ -280,8 +293,19 @@ ncclResult_t nccl_ofi_gin_closeColl(void *collComm)
 	return nccl_net_ofi_retval_translate(ret);
 }
 
+std::vector<nccl_ofi_rdma_gin_put_comm*> nccl_ofi_gin_all_comms;
+
 ncclResult_t nccl_ofi_gin_closeListen(void *listenComm)
 {
+	// Magic numbers to enable / disable histogram recording from NCCL
+	uintptr_t magic = reinterpret_cast<uintptr_t>(listenComm);
+	if (magic == 0xFFFFFFFF || magic == 0xFFFFFFFE) {
+		int recording = (magic == 0xFFFFFFFF) ? 1 : 0;
+		for (auto *c : nccl_ofi_gin_all_comms)
+			c->set_histogram_recording(recording);
+		NCCL_OFI_WARN("Set histogram recording %d", recording);
+		return ncclSuccess;
+	}
 	delete static_cast<nccl_ofi_rdma_gin_listen_comm *>(listenComm);
 	return ncclSuccess;
 }

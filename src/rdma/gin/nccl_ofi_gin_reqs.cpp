@@ -111,6 +111,12 @@ int nccl_net_ofi_gin_recv_req_t::handle_cq_entry(struct fi_cq_entry *cq_entry_ba
 				NCCL_OFI_WARN("handle_ack_completion failure");
 				return ret;
 			}
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_ACK)
+			auto *gin_comm2 = resources.get_ep().get_profile_comm();
+			if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+				gin_comm2->hist_progress->stop_timer();
+			}
+#endif
 		} else if (msg_type == GIN_MSG_TYPE_METADATA) {
 			auto *msg = static_cast<nccl_net_ofi_gin_signal_metadata_msg_t *>(
 				rx_buff_elem->ptr);
@@ -151,11 +157,22 @@ int nccl_net_ofi_gin_recv_req_t::post()
 
 int nccl_net_ofi_gin_recv_req_t::post_or_add_pending()
 {
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_CQ_COMMON_2)
+	auto *gin_comm = resources.get_ep().get_profile_comm();
+	if (gin_comm && gin_comm->histogram_recording && gin_comm->hist_progress) {
+		gin_comm->hist_progress->start_timer();
+	}
+#endif
 	int ret = post();
 	if (ret == -FI_EAGAIN) {
 		resources.add_pending_req(this);
 		ret = 0;
 	}
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_CQ_COMMON_2)
+	if (gin_comm && gin_comm->histogram_recording && gin_comm->hist_progress) {
+		gin_comm->hist_progress->stop_timer();
+	}
+#endif
 
 	return ret;
 }
@@ -168,6 +185,11 @@ int nccl_net_ofi_gin_sendack_req_t::handle_cq_entry(struct fi_cq_entry * /*cq_en
 
 	gin_comm.get_resources().return_req_to_pool(this);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SQ_COMP)
+	if (gin_comm.histogram_recording && gin_comm.hist_progress) {
+		gin_comm.hist_progress->stop_timer();
+	}
+#endif
 	return 0;
 }
 
@@ -196,6 +218,11 @@ nccl_net_ofi_gin_sendack_req_t::~nccl_net_ofi_gin_sendack_req_t()
 
 int nccl_ofi_rdma_gin_iputsignal_req::test(int *done)
 {
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_E2E)
+	int rec = gin_comm.histogram_recording;
+	if (rec && gin_comm.hist_test)
+		gin_comm.hist_test->start_timer();
+#endif
 	*done = 0;
 
 	auto &gin_ep = gin_comm.get_resources().get_ep();
@@ -256,6 +283,10 @@ int nccl_ofi_rdma_gin_iputsignal_req::test(int *done)
 	   necessary. The GIN API has a separate ginProgress call, and NCCL's
 	   progress thread will continually call `ginProgress` anyway. */
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_E2E)
+	if (rec && gin_comm.hist_test)
+		gin_comm.hist_test->stop_timer();
+#endif
 	return 0;
 }
 
@@ -271,6 +302,20 @@ int nccl_net_ofi_gin_write_req_t::post()
 	return rc;
 }
 
+int nccl_net_ofi_gin_write_req_t::handle_cq_entry(struct fi_cq_entry * /*cq_entry_base*/,
+						  fi_addr_t /*src_addr*/, uint16_t rail_id)
+{
+	NCCL_OFI_TRACE_GIN_WRITE_END(dev, rail_id, comm, rank, msg_seq_num, this);
+	done = true;
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SQ_COMP)
+	// Value can be too small?
+	//if (gin_comm->histogram_recording && gin_comm->hist_progress) {
+	//	gin_comm->hist_progress->stop_timer();
+	//}
+#endif
+	return 0;
+}
+
 int nccl_net_ofi_gin_metadata_send_req_t::post()
 {
 	nccl_ofi_gin_mr_handle_t *metadata_handle =
@@ -284,6 +329,21 @@ int nccl_net_ofi_gin_metadata_send_req_t::post()
 	}
 
 	return rc;
+}
+
+int nccl_net_ofi_gin_metadata_send_req_t::handle_cq_entry(struct fi_cq_entry * /*cq_entry_base*/,
+							  fi_addr_t /*src_addr*/,
+							  uint16_t rail_id_arg)
+{
+	NCCL_OFI_TRACE_GIN_METADATA_SEND_END(dev, rail_id_arg, comm, rank, msg_seq_num, this);
+	done = true;
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SQ_COMP)
+	// Value can be too small?
+	//if (gin_comm->histogram_recording && gin_comm->hist_progress) {
+	//	gin_comm->hist_progress->stop_timer();
+	//}
+#endif
+	return 0;
 }
 
 nccl_net_ofi_gin_metadata_send_req_t::~nccl_net_ofi_gin_metadata_send_req_t()

@@ -6,6 +6,7 @@
 
 #include "rdma/gin/nccl_ofi_gin_resources.h"
 #include "rdma/gin/nccl_ofi_gin_reqs.h"
+#include "rdma/gin/nccl_ofi_gin.h"
 
 #include "nccl_ofi_assert.h"
 #include "nccl_ofi_cuda.h"
@@ -43,6 +44,12 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_completions(struct fi_cq_data_entry *cq_
 	int ret = 0;
 
 	for (uint64_t comp_idx = 0; comp_idx < num_cqes; comp_idx++) {
+#if (PROFILE_GIN_PROGRESS >= GIN_PROG_SQ_COMP && PROFILE_GIN_PROGRESS <= GIN_PROG_RQ_ACK)
+		auto *gin_comm = get_profile_comm();
+		if (gin_comm && gin_comm->histogram_recording && gin_comm->hist_progress) {
+			gin_comm->hist_progress->start_timer();
+		}
+#endif
 		void *op_ctx = cq_entry[comp_idx].op_context;
 
 		if (OFI_UNLIKELY(op_ctx == NULL)) {
@@ -81,7 +88,7 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_error_entry(struct fi_cq_err_entry *err_
 	return ctx->handle_error_entry(cq, err_entry, rail_id);
 }
 
-int nccl_ofi_rdma_gin_ep_t::gin_process_cq_rail(uint16_t rail_id)
+int nccl_ofi_rdma_gin_ep_t::gin_process_cq_rail(uint16_t rail_id, int *num_cq_entries)
 {
 	assert(rail_id < num_rails);
 
@@ -92,11 +99,27 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_cq_rail(uint16_t rail_id)
 	int ret = 0;
 	size_t iter = 0;
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_CQ_COMMON_1)
+	auto *gin_comm = get_profile_comm();
+#endif
+
 	do {
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_CQ_COMMON_1)
+		if (gin_comm && gin_comm->histogram_recording && gin_comm->hist_progress) {
+			gin_comm->hist_progress->start_timer();
+		}
+#endif
 		++iter;
 		/* Receive completions for the given rail */
 		rc = fi_cq_readfrom(rail.rail_cq.get(), cqe_buffers, cq_read_count, src_addrs);
 		if (rc > 0) {
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_CQ_COMMON_1)
+			if (rc == ((ssize_t) cq_read_count) && gin_comm && gin_comm->histogram_recording && gin_comm->hist_progress) {
+				gin_comm->hist_progress->stop_timer();
+			}
+#endif
+			if (num_cq_entries)
+				*num_cq_entries += (int)rc;
 			ret = gin_process_completions(cqe_buffers, src_addrs, rc, rail_id);
 			if (OFI_UNLIKELY(ret != 0))
 				goto exit;
@@ -144,13 +167,20 @@ exit:
 	return ret;
 }
 
-int nccl_ofi_rdma_gin_ep_t::process_cq()
+int nccl_ofi_rdma_gin_ep_t::process_cq(int *num_cq_entries)
 {
 	int ret = 0;
-
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_CQ_COMMON_0)
+	auto *gin_comm = get_profile_comm();
+#endif
 	/* Process completion queues for all rails */
 	for (uint16_t rail_id = 0; rail_id < num_rails; ++rail_id) {
-		ret = gin_process_cq_rail(rail_id);
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_CQ_COMMON_0)
+		if (rail_id == 0 && gin_comm && gin_comm->histogram_recording && gin_comm->hist_progress) {
+		        gin_comm->hist_progress->stop_timer();
+		}
+#endif
+		ret = gin_process_cq_rail(rail_id, num_cq_entries);
 		if (ret != 0) {
 			NCCL_OFI_WARN("Failed to process CQ for rail %u: %d", rail_id, ret);
 			return ret;
@@ -474,10 +504,16 @@ nccl_ofi_gin_resources::~nccl_ofi_gin_resources()
 	   then close the endpoints. */
 }
 
-int nccl_ofi_gin_resources::progress()
+int nccl_ofi_gin_resources::progress(int *num_cq_entries)
 {
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_CQ_COMMON_0)
+	auto *gin_comm = gin_ep.get_profile_comm();
+	if (gin_comm && gin_comm->histogram_recording && gin_comm->hist_progress) {
+		gin_comm->hist_progress->start_timer();
+	}
+#endif
 	std::lock_guard scoped_ep_lock(gin_ep.ep_lock);
-	int ret = gin_ep.process_cq();
+	int ret = gin_ep.process_cq(num_cq_entries);
 	if (OFI_UNLIKELY(ret != 0)) {
 		return ret;
 	}

@@ -299,13 +299,8 @@ public:
 
 	int post() override;
 
-	int handle_cq_entry(struct fi_cq_entry * /*cq_entry_base*/, fi_addr_t /*src_addr*/,
-			    uint16_t rail_id) override
-	{
-		NCCL_OFI_TRACE_GIN_WRITE_END(dev, rail_id, comm, rank, msg_seq_num, this);
-		done = true;
-		return 0;
-	}
+	int handle_cq_entry(struct fi_cq_entry *cq_entry_base, fi_addr_t src_addr,
+			    uint16_t rail_id) override;
 
 	int test(int *done_out) override
 	{
@@ -354,14 +349,8 @@ public:
 
 	int post() override;
 
-	int handle_cq_entry(struct fi_cq_entry * /*cq_entry_base*/, fi_addr_t /*src_addr*/,
-			    uint16_t rail_id_arg) override
-	{
-		NCCL_OFI_TRACE_GIN_METADATA_SEND_END(dev, rail_id_arg, comm, rank, msg_seq_num,
-						     this);
-		done = true;
-		return 0;
-	}
+	int handle_cq_entry(struct fi_cq_entry *cq_entry_base, fi_addr_t src_addr,
+			    uint16_t rail_id_arg) override;
 
 	int test(int *done_out) override
 	{

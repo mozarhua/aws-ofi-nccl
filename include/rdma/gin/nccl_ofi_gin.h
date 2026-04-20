@@ -13,6 +13,11 @@
 #include "nccl_ofi.h"
 #include "nccl_ofi_gdrcopy.h"
 #include "nccl_ofi_tracepoint.h"
+#include "stats/histogram.h"
+#include <vector>
+
+class nccl_ofi_rdma_gin_put_comm;
+extern std::vector<nccl_ofi_rdma_gin_put_comm*> nccl_ofi_gin_all_comms;
 
 #include <bitset>
 
@@ -178,6 +183,25 @@ public:
 			  nccl_net_ofi_send_comm *s_comm_, nccl_net_ofi_recv_comm *r_comm_);
 
 	~nccl_ofi_rdma_gin_put_comm();
+
+	void set_histogram_recording(int recording)
+	{
+		if (histogram_recording != recording) {
+			if (!hist_test) {
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SIGNAL)
+				static std::vector<size_t> bins = {0, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1500, 2000};
+#else
+				static std::vector<size_t> bins = {0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1500, 2000};
+#endif
+				static const std::chrono::nanoseconds ovh(25);
+				hist_test = new gin_histogram_t("gin test()", histogram_custom_binner<size_t>(bins), ovh);
+				hist_iput_signal = new gin_histogram_t("gin iputSignal()", histogram_custom_binner<size_t>(bins), ovh);
+				std::string progress_name = "gin progress()" + std::to_string(PROFILE_GIN_PROGRESS);
+				hist_progress = new gin_histogram_t(progress_name, histogram_custom_binner<size_t>(bins), ovh);
+			}
+			histogram_recording = recording;
+		}
+	}
 
 	nccl_ofi_gin_resources &get_resources()
 	{
@@ -383,6 +407,19 @@ private:
 	friend class nccl_ofi_rdma_gin_listen_comm;
 
 public:
+	/* Histogram recording flag, set by NCCL via test() parameter.
+	   Public for direct access in hot paths. */
+	int histogram_recording = 0;
+
+	/* Histograms for profiling GIN data paths (allocated when first recording starts) */
+	using gin_histogram_t = timer_histogram<histogram_custom_binner<size_t>>;
+	gin_histogram_t *hist_test = nullptr;
+	gin_histogram_t *hist_iput_signal = nullptr;
+	gin_histogram_t *hist_progress = nullptr;
+	gin_histogram_t *hist_timer_overhead = nullptr;
+	gin_histogram_t *hist_timer_overhead2 = nullptr;
+	gin_histogram_t *hist_timer_overhead3 = nullptr;
+
 	/* NVTX tracing support - public for macro access (parallel to RDMA struct pattern) */
 #if HAVE_NVTX_TRACING
 	nvtxDomainHandle_t nvtx_domain[NCCL_OFI_N_NVTX_DOMAIN_PER_COMM];

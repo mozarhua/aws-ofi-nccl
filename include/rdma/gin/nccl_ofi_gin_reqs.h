@@ -336,7 +336,6 @@ public:
 
 	int handle_cq_entry(struct fi_cq_entry *cq_entry_base, fi_addr_t src_addr,
 			    uint16_t rail_id) override;
-
 private:
 	struct fid_ep *ep;
 	void *src;

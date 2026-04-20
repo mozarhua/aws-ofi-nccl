@@ -37,7 +37,7 @@ ncclResult_t nccl_ofi_gin_regMrSymDmaBuf(void *collComm, void *data, size_t size
 ncclResult_t nccl_ofi_gin_deregMrSym(void *collComm, void *mhandle);
 ncclResult_t nccl_ofi_gin_closeColl(void *collComm);
 ncclResult_t nccl_ofi_gin_closeListen(void *listenComm);
-ncclResult_t nccl_ofi_gin_ginProgress(void *collComm);
+ncclResult_t nccl_ofi_gin_ginProgress(void *collComm, int *num_cq_entries);
 ncclResult_t nccl_ofi_gin_finalize(void *ctx);
 
 #endif /* NCCL_OFI_GIN_GDAKI_H_ */

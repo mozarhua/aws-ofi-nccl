@@ -30,8 +30,8 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(nccl_ofi_gin_resources &r
 				     nccl_net_ofi_send_comm *s_comm_,
 				     nccl_net_ofi_recv_comm *r_comm_)
     : resources(resources_arg), resource_releaser { resources }, rank(rank_), nranks(nranks_),
-      dev(s_comm_->dev_id), ag_comm(s_comm_, r_comm_, rank_, nranks_),
-      metadata_fl(nullptr, &freelist_deleter)
+      dev(s_comm_->dev_id), metadata_fl(nullptr, &freelist_deleter),
+      ag_comm(s_comm_, r_comm_, rank_, nranks_)
 {
 	auto &ep = resources.get_ep();
 
@@ -134,7 +134,7 @@ static inline void set_rail_address(nccl_ofi_gin_ep_rail_t &rail, nccl_ofi_addr 
 
 static inline int rail_addr_insert(nccl_ofi_gin_ep_rail_t &rail, const nccl_ofi_addr &ep_addr,
 				   uint32_t peer_rank, fi_addr_t &ofi_addr,
-				   std::unordered_map<fi_addr_t, uint32_t> &rank_map)
+				   std::vector<uint32_t> &rank_map)
 {
 	int ret = fi_av_insert(rail.av.get(), ep_addr.addr, 1, &ofi_addr, 0, nullptr);
 	/* fi_av_insert() returns the number of addresses that were successfully inserted */
@@ -144,12 +144,19 @@ static inline int rail_addr_insert(nccl_ofi_gin_ep_rail_t &rail, const nccl_ofi_
 		return -EIO;
 	}
 
-	auto res = rank_map.insert(std::make_pair(ofi_addr, peer_rank));
-	if (res.second == false) {
+	/* Validate that fi_addr_t is a dense index (FI_AV_TABLE assumption) */
+	if (ofi_addr >= rank_map.size()) {
+		NCCL_OFI_WARN("fi_addr %lu out of range (size %zu) for peer rank %d. "
+			      "Is the address vector using FI_AV_TABLE?",
+			      ofi_addr, rank_map.size(), peer_rank);
+		return -EIO;
+	}
+	if (rank_map[ofi_addr] != UINT32_MAX) {
 		NCCL_OFI_WARN("Invalid duplicate address %lu for peer rank %d", ofi_addr,
 			      peer_rank);
 		return -EIO;
 	}
+	rank_map[ofi_addr] = peer_rank;
 
 	return 0;
 }
@@ -219,6 +226,12 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 
 	gin_comm->rank_comms.resize(nranks);
 
+	/* Pre-allocate rank_map vectors for direct fi_addr_t indexing.
+	 * UINT32_MAX serves as "not populated" sentinel. */
+	for (int r = 0; r < num_rails; ++r) {
+		gin_comm->rank_map[r].assign(nranks, UINT32_MAX);
+	}
+
 	/**
 	 * Exchange connection metadata with all ranks using bootstrap ring
 	 */
@@ -250,7 +263,8 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 	}
 
 	(*gin_comm_out) = gin_comm;
-	NCCL_OFI_WARN("Connected: ep: %p, gin_comm: %p", ep, gin_comm);
+	// extra print message to check threading model and EP used for each gin_comm
+	NCCL_OFI_WARN("Connected: ep: %p, gin_comm: %p", &gin_ep, gin_comm);
 	return 0;
 }
 
@@ -652,14 +666,13 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 }
 
 static inline uint32_t get_peer_rank(fi_addr_t src_addr,
-				     std::unordered_map<fi_addr_t, uint32_t> &rank_map)
+				     const std::vector<uint32_t> &rank_map)
 {
-	auto it = rank_map.find(src_addr);
-	if (it == rank_map.end()) {
+	if (OFI_UNLIKELY(src_addr >= rank_map.size() || rank_map[src_addr] == UINT32_MAX)) {
 		NCCL_OFI_WARN("Failed to find rank for src addr %lu", src_addr);
 		throw std::runtime_error("Failed to find rank");
 	}
-	return it->second;
+	return rank_map[src_addr];
 }
 
 static inline uint64_t get_req_map_key(uint32_t peer_rank, uint16_t msg_seq_num)

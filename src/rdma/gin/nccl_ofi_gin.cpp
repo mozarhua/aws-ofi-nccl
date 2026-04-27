@@ -533,12 +533,12 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		       signalMhandle, signalValue, signalOp, msg_seq_num, is_ack_requested);
 
 	int ret = 0;
-	std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> write_reqs {};
-	nccl_net_ofi_gin_metadata_send_req_t *send_req = nullptr;
+	//std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> write_reqs {};
+	//nccl_net_ofi_gin_metadata_send_req_t *send_req = nullptr;
 
 	/* Create umbrella request first for tracing */
 	auto *req = resources.get_req_from_pool<nccl_ofi_rdma_gin_iputsignal_req>(
-		*this, dst_rank, msg_seq_num, write_reqs, nullptr, is_ack_requested);
+		*this, dst_rank, msg_seq_num, /*write_reqs, nullptr,*/ is_ack_requested);
 
 	NCCL_OFI_TRACE_GIN_IPUT_SIGNAL_BEGIN(dev, size, this, dst_rank, msg_seq_num, req);
 
@@ -567,10 +567,13 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 				gin_ep.get_rail(xfer_info->rail_id).ofi_ep.get(),
 				(void *)((uintptr_t)src + xfer_info->offset), xfer_info->msg_size,
 				desc, data, rank_comm.address[xfer_info->rail_id],
-				dest + xfer_info->offset, dest_remote_mr.mr_key[xfer_info->rail_id],
-				this, dev, dst_rank, msg_seq_num);
+				dest + xfer_info->offset, dest_remote_mr.mr_key[xfer_info->rail_id]/*,
+				this, dev, dst_rank, msg_seq_num*/);
 
-			write_reqs[wr_it++] = write_req;
+			write_req->req_pending_byte = &(req->reqs_pending[wr_it]);
+			write_req->set_info(this, dev, dst_rank, msg_seq_num);
+			req->reqs_pending[wr_it] = true;
+			wr_it++; //write_reqs[wr_it++] = write_req;
 			NCCL_OFI_TRACE_GIN_WRITE_BEGIN(dev, xfer_info->rail_id, xfer_info->msg_size,
 						       this, dst_rank, msg_seq_num, write_req);
 			ret = write_req->post();
@@ -589,12 +592,12 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 	}
 
 	/* Update umbrella request with write_reqs */
-	req->write_reqs = write_reqs;
-
-	nccl_ofi_freelist::fl_entry *metadata_elem = nullptr;
+	//req->write_reqs = write_reqs;
+	//nccl_ofi_freelist::fl_entry *metadata_elem = nullptr;
 
 	if (signalOp != 0) {
 		/* Post metadata send with signal information */
+		nccl_ofi_freelist::fl_entry *metadata_elem = nullptr;
 
 		metadata_elem = metadata_fl.get()->entry_alloc();
 		if (!metadata_elem) {
@@ -632,10 +635,11 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			metadata_send->ack.ack_count = 0;
 		}
 
+		nccl_net_ofi_gin_metadata_send_req_t *send_req;
 		send_req = resources.get_req_from_pool<nccl_net_ofi_gin_metadata_send_req_t>(
 			gin_ep.get_rail(rail_id).ofi_ep.get(), rail_id, metadata_elem,
-			rank_comm.address[rail_id], metadata_fl.get(), this, dev, dst_rank,
-			msg_seq_num);
+			rank_comm.address[rail_id], metadata_fl.get()/*, this, dev, dst_rank,
+			msg_seq_num*/);
 
 		NCCL_OFI_TRACE_GIN_METADATA_SEND_BEGIN(dev, rail_id, this, dst_rank, msg_seq_num,
 						       send_req);
@@ -647,12 +651,16 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			NCCL_OFI_WARN("Metadata send failed for seq_num %hu", msg_seq_num);
 			resources.return_req_to_pool(send_req);
 			resources.return_req_to_pool(req);
+			// potential leak of write_req...
 			return ret;
 		}
+		send_req->set_info(this, dev, dst_rank, msg_seq_num); // lttng only
+		send_req->req_pending_byte = &(req->reqs_pending[MAX_NUM_RAILS]); // last one
+		req->reqs_pending[MAX_NUM_RAILS] = true;
 	}
 
 	/* Update umbrella request with send_req */
-	req->send_req = send_req;
+	//req->send_req = send_req;
 
 	rank_comm.active_put_signal.set(msg_seq_num & GIN_IMM_SEQ_MASK, is_ack_requested);
 	rank_comm.next_target_seq_num = (rank_comm.next_target_seq_num + 1) & GIN_IMM_SEQ_MASK;
@@ -695,7 +703,7 @@ int nccl_ofi_rdma_gin_put_comm::do_gin_signal(const nccl_net_ofi_gin_signal_meta
 	}
 	nccl_ofi_rdma_gin_symm_mr_handle *mr_handle = it->second;
 
-	if (mr_handle->type == NCCL_PTR_CUDA) {
+	if (OFI_LIKELY(mr_handle->type == NCCL_PTR_CUDA)) {
 		uint64_t idx = metadata.signal_offset / sizeof(uint64_t);
 		uint64_t new_value = mr_handle->signal_shadow[idx] + add_value;
 		mr_handle->signal_shadow[idx] = new_value;
@@ -890,8 +898,8 @@ int nccl_ofi_rdma_gin_put_comm::iput_signal_deliver_all(uint32_t peer_rank)
 }
 
 int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
-	fi_addr_t src_addr, uint16_t rail_id,
-	const nccl_net_ofi_gin_signal_metadata_msg_t *metadata_msg)
+	const nccl_net_ofi_gin_signal_metadata_msg_t *metadata_msg,
+	fi_addr_t src_addr, uint16_t rail_id)
 {
 	int ret = 0;
 
@@ -972,15 +980,16 @@ int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(fi_addr_t src_addr, uint16
 	return 0;
 }
 
-int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(fi_addr_t src_addr, uint16_t rail_id,
-						      uint16_t msg_seq_num, uint64_t total_segms,
-						      size_t len, bool is_ack_requested)
+int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(struct fi_cq_data_entry * cq_entry,
+						      fi_addr_t src_addr, uint16_t rail_id)
 {
-	int ret = 0;
-
+	/* RDMA write-immediate completion */
+	uint16_t msg_seq_num = GIN_IMM_GET_SEQ_NUM(cq_entry->data);
 	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
 
+	uint64_t total_segms = GIN_IMM_GET_SEG_CNT(cq_entry->data);
 	uint64_t map_key = get_req_map_key(peer_rank, msg_seq_num);
+	bool is_ack_requested = GIN_IMM_GET_ACK_REQUESTED(cq_entry->data);
 
 	auto it = outstanding_iput_signal_recv_reqs.find(map_key);
 	nccl_net_ofi_gin_iputsignal_recv_req *req;
@@ -996,7 +1005,7 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(fi_addr_t src_add
 		assert(req->total_segments == total_segms);
 		req->num_seg_completions += 1;
 	}
-	NCCL_OFI_TRACE_GIN_RECV_WRITE(dev, rail_id, len, this, peer_rank, msg_seq_num, req);
+	NCCL_OFI_TRACE_GIN_RECV_WRITE(dev, rail_id, cq_entry->len, this, peer_rank, msg_seq_num, req);
 
 	if (req->num_seg_completions == req->total_segments) {
 		/* Fill in the fields related to metadata */
@@ -1017,7 +1026,7 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(fi_addr_t src_add
 		hist_progress->start_timer();
 	}
 #endif
-	ret = iput_signal_deliver_all(peer_rank);
+	int ret = iput_signal_deliver_all(peer_rank);
 
 #if (PROFILE_GIN_PROGRESS == GIN_PROG_SEND_ACK)
 	// Potentailly two peaks and need to adjust the binner.

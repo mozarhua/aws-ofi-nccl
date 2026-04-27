@@ -242,11 +242,11 @@ public:
 
 	int deregMrSym(nccl_ofi_gin_symm_mr_handle_t *mr_handle) override;
 
-	void increment_outstanding_ack_counter()
+	inline void increment_outstanding_ack_counter()
 	{
 		outstanding_ack_counter++;
 	}
-	void decrement_outstanding_ack_counter()
+	inline void decrement_outstanding_ack_counter()
 	{
 		outstanding_ack_counter--;
 	}
@@ -314,8 +314,8 @@ public:
 	 * @return: 0 on success, non-zero on failure
 	 */
 	int handle_signal_metadata_completion(
-		fi_addr_t src_addr, uint16_t rail_id,
-		const nccl_net_ofi_gin_signal_metadata_msg_t *metadata_msg);
+		const nccl_net_ofi_gin_signal_metadata_msg_t *metadata_msg,
+		fi_addr_t src_addr, uint16_t rail_id);
 
 	/**
 	 * Callback for write completion (data signals only).
@@ -327,9 +327,8 @@ public:
 	 * @param len: length of the signal
 	 * @param is_ack_requested: whether the sender is requesting an ACK
 	 */
-	int handle_signal_write_completion(fi_addr_t src_addr, uint16_t rail_id,
-					   uint16_t msg_seq_num, uint64_t total_segms,
-					   size_t len, bool is_ack_requested);
+	int handle_signal_write_completion(struct fi_cq_data_entry * cq_entry,
+					   fi_addr_t src_addr, uint16_t rail_id);
 
 	/**
 	 * Callback for ACK message received via fi_recv.
@@ -353,6 +352,13 @@ private:
 
 	/* Remote comm info book */
 	std::vector<nccl_ofi_gin_peer_rank_info> rank_comms;
+
+	/**
+	 * Freelist of buffers storing signal information (type
+	 * nccl_net_ofi_gin_signal_metadata_msg_t). An entry is allocated from
+	 * this freelist for each putSignal operation.
+	 */
+	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> metadata_fl;
 
 	/* For each rail, direct-indexed table of fi_addr => peer comm rank.
 	 * Requires FI_AV_TABLE so that fi_addr_t values are dense 0-based
@@ -394,15 +400,6 @@ private:
 	int send_ack(nccl_ofi_rdma_gin_put_comm &gin_comm, uint32_t peer_rank,
 		     uint32_t ack_seq_num, uint32_t count);
 
-	/**
-	 * Freelist of buffers storing signal information (type
-	 * nccl_net_ofi_gin_signal_metadata_msg_t). An entry is allocated from
-	 * this freelist for each putSignal operation.
-	 */
-	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> metadata_fl;
-
-	/* AllGather ring for metadata exchange */
-	nccl_ofi_gin_allgather_comm ag_comm;
 
 	int do_gin_signal(const nccl_net_ofi_gin_signal_metadata_msg_t &metadata);
 
@@ -413,6 +410,9 @@ private:
 	int iput_signal_deliver_all(uint32_t peer_rank);
 
 	friend class nccl_ofi_rdma_gin_listen_comm;
+
+	/* AllGather ring for metadata exchange */
+	nccl_ofi_gin_allgather_comm ag_comm;
 
 public:
 	/* Histogram recording flag, set by NCCL via test() parameter.

@@ -7,6 +7,7 @@
 
 #include "rdma/fabric.h"
 
+#include <array>
 #include <deque>
 #include <stdexcept>
 #include <vector>
@@ -227,28 +228,27 @@ public:
 	 * Get GIN communicator with given comm_id from map. Throw exception if
 	 * not found.
 	 */
-	nccl_ofi_rdma_gin_put_comm &get_comm(uint32_t comm_id)
+	nccl_ofi_rdma_gin_put_comm &get_comm(uint16_t comm_id)
 	{
-		auto it = gin_comms.find(comm_id);
-		if (it == gin_comms.end()) {
+		if (OFI_UNLIKELY(comm_id >= GIN_MAX_COMMS || gin_comms[comm_id] == nullptr)) {
 			NCCL_OFI_WARN("Invalid comm_id %d", comm_id);
 			throw std::runtime_error("Failed to find comm_id");
 		}
 
-		return *(it->second);
+		return *gin_comms[comm_id];
 	}
 
 	/**
 	 * Set a GIN communicator with given comm_id in map. Throw exception if
 	 * comm_id already exists.
 	 */
-	void set_comm(uint32_t comm_id, nccl_ofi_rdma_gin_put_comm &comm)
+	void set_comm(uint16_t comm_id, nccl_ofi_rdma_gin_put_comm &comm)
 	{
-		auto it = gin_comms.insert({ comm_id, &comm });
-		if (!it.second) {
+		if (OFI_UNLIKELY(comm_id >= GIN_MAX_COMMS || gin_comms[comm_id] != nullptr)) {
 			NCCL_OFI_WARN("Failed to insert duplicate comm_id %d", comm_id);
 			throw std::runtime_error("Failed to insert comm_id");
 		}
+		gin_comms[comm_id] = &comm;
 	}
 
 	nccl_ofi_rdma_gin_ep_t &get_ep()
@@ -352,27 +352,32 @@ public:
 	}
 
 private:
+	/* === HOT — accessed every CQ completion and/or iputSignal === */
 	nccl_ofi_gin_ep_holder ep_holder;
 
-	std::unordered_map<uint32_t, nccl_ofi_rdma_gin_put_comm *> gin_comms;
-
-	nccl_ofi_idpool_t comm_id_pool;
-
 	nccl_ofi_rdma_gin_ep_t gin_ep;
+
+	/* Requests pool used by all comms of this resource */
+	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> req_fl;
+
+	/* Pool of buffers for recv requests */
+	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> rx_buff_fl;
+
+	/* Reqs for RX buffers */
+	std::vector<nccl_net_ofi_gin_recv_req_t> recv_reqs;
+
+	/* === WARM — accessed on iputSignal / ACK / retry paths === */
+
+	/* For rail scheduling. Currently we do round-robin among rails. */
+	uint16_t next_rail_id = 0;
+
+	/* Pool of registered buffers for ACK send messages */
+	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> ack_send_fl;
 
 	/**
 	 * Queue of pending Libfabric requests to be retried
 	 */
 	std::deque<nccl_net_ofi_gin_op_req_t *> pending_requests;
-
-	/* Number of associated comms */
-	size_t ref_cnt = 0;
-
-	/* For rail scheduling. Currently we do round-robin among rails. */
-	uint16_t next_rail_id = 0;
-
-	/* Requests pool used by all comms of this resource */
-	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> req_fl;
 
 	/**
 	 * Retry requests that were pending due to EAGAIN or lack of space in
@@ -380,17 +385,19 @@ private:
 	 */
 	int retry_pending_reqs();
 
-	/* Pool of buffers for recv requests */
-	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> rx_buff_fl;
+	/* === COLD — accessed only at connect/disconnect time === */
 
-	/* Pool of registered buffers for ACK send messages */
-	std::unique_ptr<nccl_ofi_freelist, decltype(&freelist_deleter)> ack_send_fl;
+	nccl_ofi_idpool_t comm_id_pool;
 
-	/* Reqs for RX buffers */
-	std::vector<nccl_net_ofi_gin_recv_req_t> recv_reqs;
+	/* Number of associated comms */
+	size_t ref_cnt = 0;
 
 	/* Post all recv buffers for a given rail */
 	void post_rx_buffs_on_rail(nccl_ofi_gin_ep_rail_t &rail, size_t num_buffers);
+
+	/* === Self-contained hot lookup — 8KB array at end to avoid pushing
+	   other hot members apart === */
+	std::array<nccl_ofi_rdma_gin_put_comm *, GIN_MAX_COMMS> gin_comms{};
 };
 
 #endif

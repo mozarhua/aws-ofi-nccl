@@ -74,6 +74,13 @@ int nccl_net_ofi_gin_recv_req_t::handle_cq_entry(struct fi_cq_entry *cq_entry_ba
 {
 	assert(this->rail.rail_id == rail_id_arg);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_ACK)
+	// 0430 redo afer recv_req_t::handle_cq_entry (to know what roughly jumping from the parent / container took).
+	//auto *gin_comm2 = resources.get_ep().get_profile_comm();
+	//if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+	//	gin_comm2->hist_progress->stop_timer();
+	//}
+#endif
 	auto *cq_entry = reinterpret_cast<struct fi_cq_data_entry *>(cq_entry_base);
 
 	int ret = 0;
@@ -81,8 +88,20 @@ int nccl_net_ofi_gin_recv_req_t::handle_cq_entry(struct fi_cq_entry *cq_entry_ba
 	if (cq_entry->flags & FI_REMOTE_WRITE) {
 		/* RDMA write-immediate completion */
 		uint32_t comm_id = GIN_IMM_GET_COMM_ID(cq_entry->data);
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_NON_ACK)
+		//auto *gin_comm2 = resources.get_ep().get_profile_comm();
+		//if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+		//	gin_comm2->hist_progress->stop_timer();
+		//}
+#endif
 		auto &gin_comm = resources.get_comm(comm_id);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_NON_ACK)
+		auto *gin_comm2 = resources.get_ep().get_profile_comm();
+		if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+			gin_comm2->hist_progress->stop_timer();
+		}
+#endif
 		ret = gin_comm.handle_signal_write_completion(cq_entry, src_addr, rail_id_arg);
 		if (ret != 0) {
 			NCCL_OFI_WARN("gin_handle_signal_write_completion failure");
@@ -95,8 +114,22 @@ int nccl_net_ofi_gin_recv_req_t::handle_cq_entry(struct fi_cq_entry *cq_entry_ba
 			auto *ack_msg =
 				static_cast<gin_ack_msg_t *>(rx_buff_elem->ptr);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_ACK)
+			// 0430 redo before get_comm
+			//auto *gin_comm2 = resources.get_ep().get_profile_comm();
+			//if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+			//	gin_comm2->hist_progress->stop_timer();
+			//}
+#endif
 			auto &gin_comm = resources.get_comm(ack_msg->ack.comm_id);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_ACK)
+			// 0430 redo afer get_comm
+			//auto *gin_comm2 = resources.get_ep().get_profile_comm();
+			//if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+			//	gin_comm2->hist_progress->stop_timer();
+			//}
+#endif
 			ret = gin_comm.handle_ack_completion(src_addr, rail_id_arg,
 							     ack_msg);
 			if (OFI_UNLIKELY(ret != 0)) {
@@ -113,8 +146,20 @@ int nccl_net_ofi_gin_recv_req_t::handle_cq_entry(struct fi_cq_entry *cq_entry_ba
 			auto *msg = static_cast<nccl_net_ofi_gin_signal_metadata_msg_t *>(
 				rx_buff_elem->ptr);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_NON_ACK)
+			//auto *gin_comm2 = resources.get_ep().get_profile_comm();
+			//if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+			//	gin_comm2->hist_progress->stop_timer();
+			//}
+#endif
 			auto &gin_comm = resources.get_comm(msg->remote_comm_id);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_NON_ACK)
+			auto *gin_comm2 = resources.get_ep().get_profile_comm();
+			if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+				gin_comm2->hist_progress->stop_timer();
+			}
+#endif
 			ret = gin_comm.handle_signal_metadata_completion(msg, src_addr,
 									 rail_id_arg);
 			if (ret != 0) {
@@ -173,14 +218,19 @@ int nccl_net_ofi_gin_sendack_req_t::handle_cq_entry(struct fi_cq_entry * /*cq_en
 						     fi_addr_t /*src_addr*/,
 						     uint16_t /*rail_id_arg*/)
 {
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SQ_COMP)
+	//if (gin_comm.histogram_recording && gin_comm.hist_progress) {
+	//	gin_comm.hist_progress->stop_timer();
+	//}
+#endif
 	gin_comm.decrement_outstanding_ack_counter();
 
 	gin_comm.get_resources().return_req_to_pool(this);
 
 #if (PROFILE_GIN_PROGRESS == GIN_PROG_SQ_COMP)
-	if (gin_comm.histogram_recording && gin_comm.hist_progress) {
-		gin_comm.hist_progress->stop_timer();
-	}
+	//if (gin_comm.histogram_recording && gin_comm.hist_progress) {
+	//	gin_comm.hist_progress->stop_timer();
+	//}
 #endif
 	return 0;
 }
@@ -267,16 +317,25 @@ int nccl_net_ofi_gin_write_req_t::post()
 int nccl_net_ofi_gin_write_req_t::handle_cq_entry(struct fi_cq_entry * /*cq_entry_base*/,
 						  fi_addr_t /*src_addr*/, uint16_t rail_id)
 {
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SQ_COMP)
+	auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(comm);
+	if (gin_comm->histogram_recording && gin_comm->hist_progress) {
+		gin_comm->hist_progress->stop_timer();
+	}
+#endif
 	NCCL_OFI_TRACE_GIN_WRITE_END(dev, rail_id, comm, rank, msg_seq_num, this);
 
 	assert(req_pending_byte != nullptr);
 	*req_pending_byte = false;
 
-	auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(comm);
-	//auto &gin_ep = gin_comm->get_resources().get_ep();
-	//std::lock_guard scoped_ep_lock(gin_ep.ep_lock);
+	//auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(comm);
 	gin_comm->get_resources().return_req_to_pool(this);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SQ_COMP)
+	//if (gin_comm->histogram_recording && gin_comm->hist_progress) {
+	//	gin_comm->hist_progress->stop_timer();
+	//}
+#endif
 	return 0;
 }
 
@@ -300,21 +359,24 @@ int nccl_net_ofi_gin_metadata_send_req_t::handle_cq_entry(struct fi_cq_entry * /
 							  uint16_t rail_id_arg)
 {
 #if (PROFILE_GIN_PROGRESS == GIN_PROG_SQ_COMP)
-	// Value can be too small?
-	//if (gin_comm->histogram_recording && gin_comm->hist_progress) {
-	//      gin_comm->hist_progress->stop_timer();
-	//}
+	auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(comm);
+	if (gin_comm->histogram_recording && gin_comm->hist_progress) {
+		gin_comm->hist_progress->stop_timer();
+	}
 #endif
 	NCCL_OFI_TRACE_GIN_METADATA_SEND_END(dev, rail_id_arg, comm, rank, msg_seq_num, this);
 
 	assert(req_pending_byte != nullptr);
 	*req_pending_byte = false;
 
-	auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(comm);
-	//auto &gin_ep = gin_comm->get_resources().get_ep();
-	//std::lock_guard scoped_ep_lock(gin_ep.ep_lock);
+	//auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(comm);
 	gin_comm->get_resources().return_req_to_pool(this);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_SQ_COMP)
+	if (gin_comm->histogram_recording && gin_comm->hist_progress) {
+		gin_comm->hist_progress->stop_timer();
+	}
+#endif
 	return 0;
 }
 

@@ -937,10 +937,10 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 	}
 	NCCL_OFI_TRACE_GIN_RECV_METADATA(dev, rail_id, this, peer_rank, msg_seq_num, req);
 #if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_NON_ACK)
-	auto *gin_comm2 = resources.get_ep().get_profile_comm();
-	if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
-		gin_comm2->hist_progress->stop_timer();
-	}
+	//auto *gin_comm2 = resources.get_ep().get_profile_comm();
+	//if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+	//	gin_comm2->hist_progress->stop_timer();
+	//}
 #endif
 #if (PROFILE_GIN_PROGRESS == GIN_PROG_SEND_ACK)
 	// Potentailly two peaks and need to adjust the binner.
@@ -969,6 +969,13 @@ int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(fi_addr_t src_addr, uint16
 
 	NCCL_OFI_TRACE_GIN_ACK_RECV(dev, rail_id, this, peer_rank, ack_seq_num);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_ACK)
+	// 0430 redo before clear_ack_range (to know what roughly clear_ack_range took).
+	//auto *gin_comm2 = resources.get_ep().get_profile_comm();
+	//if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+	//	gin_comm2->hist_progress->stop_timer();
+	//}
+#endif
 	/* Self-contained range ACK: clear ack_outstanding from start_seq
 	   to ack_seq_num. Each ACK carries ack_seq_num and a count so
 	   the sender needs no cumulative state (e.g. last_acked_seq_num).

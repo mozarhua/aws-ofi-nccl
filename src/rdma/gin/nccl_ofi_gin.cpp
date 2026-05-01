@@ -1106,6 +1106,13 @@ int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg_t *ack_m
 
 	NCCL_OFI_TRACE_GIN_ACK_RECV(dev, rail_id, this, peer_rank, ack_seq_num);
 
+#if (PROFILE_GIN_PROGRESS == GIN_PROG_RQ_ACK)
+	// 0430 redo before clear_ack_range (to know what roughly clear_ack_range took).
+	//auto *gin_comm2 = resources.get_ep().get_profile_comm();
+	//if (gin_comm2 && gin_comm2->histogram_recording && gin_comm2->hist_progress) {
+	//	gin_comm2->hist_progress->stop_timer();
+	//}
+#endif
 	/* Self-contained range ACK: clear ack_outstanding from start_seq
 	   to ack_seq_num. Each ACK carries ack_seq_num and a count so
 	   the sender needs no cumulative state (e.g. last_acked_seq_num).

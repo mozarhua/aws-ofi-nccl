@@ -193,26 +193,26 @@ class nccl_ofi_rdma_gin_iputsignal_req : public nccl_net_ofi_gin_base_req {
 public:
 	nccl_ofi_rdma_gin_iputsignal_req(
 		nccl_ofi_rdma_gin_put_comm &gin_comm_arg, uint32_t peer_rank_arg, uint16_t msg_seq_num_arg,
-		std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> write_reqs_arg,
-		nccl_net_ofi_gin_metadata_send_req_t *send_req_arg,
 		bool is_ack_requested_arg)
-	    : write_reqs(write_reqs_arg), send_req(send_req_arg), gin_comm(gin_comm_arg),
+	    : any_reqs_pending(0), gin_comm(gin_comm_arg),
 	      peer_rank(peer_rank_arg), msg_seq_num(msg_seq_num_arg), is_ack_requested(is_ack_requested_arg)
 	{
 	}
 
 	int test(int *done);
 
-	/* Subrequests - public to match RDMA struct pattern */
-	/* Write requests */
-	std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> write_reqs;
-	/* Metadata send request */
-	nccl_net_ofi_gin_metadata_send_req_t *send_req;
-
 	/* NVTX tracing support - public for macro access */
 #if HAVE_NVTX_TRACING
 	nvtxRangeId_t trace_id;
 #endif
+	/* Each subrequest hold a pointer to reqs_pending and unset when it's done. */
+	union {
+		/* Index: write requests: 0 to (MAX_NUM_RAILS - 1); send request: MAX_NUM_RAILS */
+		bool reqs_pending[MAX_NUM_RAILS + 1];
+		uint64_t any_reqs_pending;
+	};
+	static_assert(sizeof(reqs_pending) <= sizeof(any_reqs_pending),
+		      "any_reqs_pending must cover all reqs_pending bytes");
 
 private:
 	/* Associated Comm object */
@@ -280,38 +280,18 @@ private:
  */
 class nccl_net_ofi_gin_write_req_t : public nccl_net_ofi_gin_op_req_t {
 public:
-	bool done = false;
-	void *comm;
-	int dev;
-	uint32_t rank;
-	uint16_t msg_seq_num;
-
 	nccl_net_ofi_gin_write_req_t(struct fid_ep *ep_arg, void *src_arg, size_t size_arg,
 				     void *desc_arg, uint64_t imm_data_arg,
 				     fi_addr_t remote_addr_arg, uint64_t dest_arg, uint64_t key_arg,
-				     void *comm_arg, int dev_arg, uint32_t rank_arg,
-				     uint16_t msg_seq_num_arg)
-	    : comm(comm_arg), dev(dev_arg), rank(rank_arg), msg_seq_num(msg_seq_num_arg),
-	      ep(ep_arg), src(src_arg), size(size_arg), desc(desc_arg), imm_data(imm_data_arg),
-	      remote_addr(remote_addr_arg), dest(dest_arg), key(key_arg)
+				     void *comm_arg)
+	    : ep(ep_arg), src(src_arg), size(size_arg), desc(desc_arg), imm_data(imm_data_arg),
+	      remote_addr(remote_addr_arg), dest(dest_arg), key(key_arg), comm(comm_arg)
 	{
 	}
-
 	int post() override;
 
-	int handle_cq_entry(struct fi_cq_entry * /*cq_entry_base*/, fi_addr_t /*src_addr*/,
-			    uint16_t rail_id) override
-	{
-		NCCL_OFI_TRACE_GIN_WRITE_END(dev, rail_id, comm, rank, msg_seq_num, this);
-		done = true;
-		return 0;
-	}
-
-	int test(int *done_out) override
-	{
-		*done_out = this->done ? 1 : 0;
-		return 0;
-	}
+	int handle_cq_entry(struct fi_cq_entry *cq_entry_base, fi_addr_t src_addr,
+			    uint16_t rail_id) override;
 
 	/* NVTX tracing support - public for macro access */
 #if HAVE_NVTX_TRACING
@@ -327,6 +307,20 @@ private:
 	fi_addr_t remote_addr;
 	uint64_t dest;
 	uint64_t key;
+public:
+	void *comm;
+	bool *pending_flag;
+#if HAVE_NVTX_TRACING || HAVE_LIBLTTNG_UST
+	int dev;
+	uint32_t rank;
+	uint16_t msg_seq_num;
+
+	inline void set_info(int dev_arg, uint32_t rank_arg, uint16_t msg_seq_num_arg) {
+		dev = dev_arg;
+		rank = rank_arg;
+		msg_seq_num = msg_seq_num_arg;
+	}
+#endif
 };
 
 /**
@@ -334,40 +328,19 @@ private:
  */
 class nccl_net_ofi_gin_metadata_send_req_t : public nccl_net_ofi_gin_op_req_t {
 public:
-	bool done = false;
-	void *comm;
-	int dev;
-	uint32_t rank;
-	uint16_t msg_seq_num;
-
 	nccl_net_ofi_gin_metadata_send_req_t(struct fid_ep *ep_arg, uint16_t rail_id_arg,
 					     nccl_ofi_freelist::fl_entry *metadata_elem_arg,
 					     fi_addr_t remote_addr_arg,
-					     nccl_ofi_freelist *metadata_fl_arg, void *comm_arg,
-					     int dev_arg, uint32_t rank_arg,
-					     uint16_t msg_seq_num_arg)
-	    : comm(comm_arg), dev(dev_arg), rank(rank_arg), msg_seq_num(msg_seq_num_arg),
-	      ep(ep_arg), rail_id(rail_id_arg), metadata_elem(metadata_elem_arg),
-	      remote_addr(remote_addr_arg), metadata_fl(metadata_fl_arg)
+					     nccl_ofi_freelist *metadata_fl_arg,
+					     void *comm_arg)
+	    : ep(ep_arg), rail_id(rail_id_arg), metadata_elem(metadata_elem_arg),
+	      remote_addr(remote_addr_arg), metadata_fl(metadata_fl_arg), comm(comm_arg)
 	{
 	}
-
 	int post() override;
 
-	int handle_cq_entry(struct fi_cq_entry * /*cq_entry_base*/, fi_addr_t /*src_addr*/,
-			    uint16_t rail_id_arg) override
-	{
-		NCCL_OFI_TRACE_GIN_METADATA_SEND_END(dev, rail_id_arg, comm, rank, msg_seq_num,
-						     this);
-		done = true;
-		return 0;
-	}
-
-	int test(int *done_out) override
-	{
-		*done_out = this->done ? 1 : 0;
-		return 0;
-	}
+	int handle_cq_entry(struct fi_cq_entry *cq_entry_base, fi_addr_t src_addr,
+			    uint16_t rail_id_arg) override;
 
 	virtual ~nccl_net_ofi_gin_metadata_send_req_t() override;
 
@@ -382,6 +355,22 @@ private:
 	nccl_ofi_freelist::fl_entry *metadata_elem;
 	fi_addr_t remote_addr;
 	nccl_ofi_freelist *metadata_fl;
+
+public:
+	void *comm;
+	bool *pending_flag;
+#if HAVE_NVTX_TRACING || HAVE_LIBLTTNG_UST
+	int dev;
+	uint32_t rank;
+	uint16_t msg_seq_num;
+
+	inline void set_info(int dev_arg, uint32_t rank_arg, uint16_t msg_seq_num_arg) {
+		dev = dev_arg;
+		rank = rank_arg;
+		msg_seq_num = msg_seq_num_arg;
+	}
+#endif
+
 };
 
 /**

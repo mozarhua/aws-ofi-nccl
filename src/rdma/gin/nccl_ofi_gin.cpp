@@ -28,9 +28,10 @@ struct gin_connect_handle {
 nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(nccl_ofi_gin_resources &resources_arg, int rank_, int nranks_,
 				     nccl_net_ofi_send_comm *s_comm_,
 				     nccl_net_ofi_recv_comm *r_comm_)
-    : resources(resources_arg), resource_releaser { resources }, rank(rank_), nranks(nranks_),
-      dev(s_comm_->dev_id), ag_comm(s_comm_, r_comm_, rank_, nranks_),
-      metadata_fl(nullptr, &freelist_deleter)
+    : resources(resources_arg), resource_releaser { resources },
+      metadata_fl(nullptr, &freelist_deleter), dev(s_comm_->dev_id),
+      rank(rank_), nranks(nranks_),
+      ag_comm(s_comm_, r_comm_, rank_, nranks_)
 {
 	auto &ep = resources.get_ep();
 
@@ -401,6 +402,17 @@ int nccl_ofi_rdma_gin_put_comm::await_pending_requests()
 	return ret;
 }
 
+static inline void clear_write_reqs_pending_back_pointers(
+	std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> &write_reqs)
+{
+	/* For posted write requests, clear their back-pointers only */
+	for (uint16_t i = 0; i < MAX_NUM_RAILS; i++) {
+		if (write_reqs[i]) {
+			write_reqs[i]->pending_flag = nullptr;
+		}
+	}
+}
+
 int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr_handle_t *srcMhandle, size_t size,
 				  uint64_t dstOff, nccl_ofi_gin_symm_mr_handle_t *dstMhandle, uint32_t dst_rank,
 				  uint64_t signalOff, nccl_ofi_gin_symm_mr_handle_t *signalMhandle,
@@ -463,13 +475,14 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		       srcOff, srcMhandle, size, dstOff, dstMhandle, dst_rank, signalOff,
 		       signalMhandle, signalValue, signalOp, msg_seq_num, is_ack_requested);
 
-	int ret = 0;
-	std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> write_reqs {};
-	nccl_net_ofi_gin_metadata_send_req_t *send_req = nullptr;
 
-	/* Create umbrella request first for tracing */
+	/* Create umbrella request for tracing */
 	auto *req = resources.get_req_from_pool<nccl_ofi_rdma_gin_iputsignal_req>(
-		*this, dst_rank, msg_seq_num, write_reqs, nullptr, is_ack_requested);
+		*this, dst_rank, msg_seq_num, is_ack_requested);
+	/* Hold write_reqs for error clean up */
+	std::array<nccl_net_ofi_gin_write_req_t *, MAX_NUM_RAILS> write_reqs {};
+
+	int ret = 0;
 
 	NCCL_OFI_TRACE_GIN_IPUT_SIGNAL_BEGIN(dev, size, this, dst_rank, msg_seq_num, req);
 
@@ -499,9 +512,15 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 				(void *)((uintptr_t)src + xfer_info->offset), xfer_info->msg_size,
 				desc, data, rank_comm.address[xfer_info->rail_id],
 				dest + xfer_info->offset, dest_remote_mr.mr_key[xfer_info->rail_id],
-				this, dev, dst_rank, msg_seq_num);
+				this);
 
+			write_req->pending_flag = &(req->reqs_pending[wr_it]);
+#if HAVE_NVTX_TRACING || HAVE_LIBLTTNG_UST
+			write_req->set_info(dev, dst_rank, msg_seq_num);
+#endif
+			req->reqs_pending[wr_it] = true;
 			write_reqs[wr_it++] = write_req;
+
 			NCCL_OFI_TRACE_GIN_WRITE_BEGIN(dev, xfer_info->rail_id, xfer_info->msg_size,
 						       this, dst_rank, msg_seq_num, write_req);
 			ret = write_req->post();
@@ -512,6 +531,7 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 				NCCL_OFI_WARN("Write failed for seq_num %hu", msg_seq_num);
 				resources.return_req_to_pool(write_req);
 				nccl_net_ofi_release_schedule(scheduler, schedule);
+				clear_write_reqs_pending_back_pointers(write_reqs);
 				resources.return_req_to_pool(req);
 				return ret;
 			}
@@ -519,17 +539,14 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		nccl_net_ofi_release_schedule(scheduler, schedule);
 	}
 
-	/* Update umbrella request with write_reqs */
-	req->write_reqs = write_reqs;
-
-	nccl_ofi_freelist::fl_entry *metadata_elem = nullptr;
-
 	if (signalOp != 0) {
 		/* Post metadata send with signal information */
+		nccl_ofi_freelist::fl_entry *metadata_elem = nullptr;
 
 		metadata_elem = metadata_fl.get()->entry_alloc();
 		if (!metadata_elem) {
 			NCCL_OFI_WARN("Failed to allocate metadata freelist entry");
+			clear_write_reqs_pending_back_pointers(write_reqs);
 			resources.return_req_to_pool(req);
 			return -ENOMEM;
 		}
@@ -563,10 +580,10 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			metadata_send->ack.ack_count = 0;
 		}
 
+		nccl_net_ofi_gin_metadata_send_req_t *send_req;
 		send_req = resources.get_req_from_pool<nccl_net_ofi_gin_metadata_send_req_t>(
 			gin_ep.get_rail(rail_id).ofi_ep.get(), rail_id, metadata_elem,
-			rank_comm.address[rail_id], metadata_fl.get(), this, dev, dst_rank,
-			msg_seq_num);
+			rank_comm.address[rail_id], metadata_fl.get(), this);
 
 		NCCL_OFI_TRACE_GIN_METADATA_SEND_BEGIN(dev, rail_id, this, dst_rank, msg_seq_num,
 						       send_req);
@@ -578,12 +595,15 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			NCCL_OFI_WARN("Metadata send failed for seq_num %hu", msg_seq_num);
 			resources.return_req_to_pool(send_req);
 			resources.return_req_to_pool(req);
+			clear_write_reqs_pending_back_pointers(write_reqs);
 			return ret;
 		}
+		send_req->pending_flag = &(req->reqs_pending[MAX_NUM_RAILS]); // last one
+#if HAVE_NVTX_TRACING || HAVE_LIBLTTNG_UST
+		send_req->set_info(dev, dst_rank, msg_seq_num);
+#endif
+		req->reqs_pending[MAX_NUM_RAILS] = true;
 	}
-
-	/* Update umbrella request with send_req */
-	req->send_req = send_req;
 
 	rank_comm.active_put_signal.set(msg_seq_num & GIN_IMM_SEQ_MASK, is_ack_requested);
 	rank_comm.next_target_seq_num = (rank_comm.next_target_seq_num + 1) & GIN_IMM_SEQ_MASK;
@@ -805,8 +825,8 @@ int nccl_ofi_rdma_gin_put_comm::iput_signal_deliver_all(uint32_t peer_rank)
 }
 
 int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
-	fi_addr_t src_addr, uint16_t rail_id,
-	const nccl_net_ofi_gin_signal_metadata_msg_t *metadata_msg)
+	const nccl_net_ofi_gin_signal_metadata_msg_t *metadata_msg,
+	fi_addr_t src_addr, uint16_t rail_id)
 {
 	int ret = 0;
 
@@ -848,8 +868,8 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 	return ret;
 }
 
-int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(fi_addr_t src_addr, uint16_t rail_id,
-					     const gin_ack_msg_t *ack_msg)
+int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg_t *ack_msg,
+						      fi_addr_t src_addr, uint16_t rail_id)
 {
 	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
 	uint16_t ack_seq_num = ack_msg->ack.ack_seq_num;
@@ -869,14 +889,15 @@ int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(fi_addr_t src_addr, uint16
 	return 0;
 }
 
-int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(fi_addr_t src_addr, uint16_t rail_id,
-						      uint16_t msg_seq_num, uint64_t total_segms,
-						      size_t len, bool is_ack_requested)
+int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(struct fi_cq_data_entry * cq_entry,
+						      fi_addr_t src_addr, uint16_t rail_id)
 {
-	int ret = 0;
+	/* RDMA write-immediate completion */
+	uint64_t total_segms = GIN_IMM_GET_SEG_CNT(cq_entry->data);
+	uint16_t msg_seq_num = GIN_IMM_GET_SEQ_NUM(cq_entry->data);
+	bool is_ack_requested = GIN_IMM_GET_ACK_REQUESTED(cq_entry->data);
 
 	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
-
 	uint64_t map_key = get_req_map_key(peer_rank, msg_seq_num);
 
 	auto it = outstanding_iput_signal_recv_reqs.find(map_key);
@@ -893,7 +914,7 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(fi_addr_t src_add
 		assert(req->total_segments == total_segms);
 		req->num_seg_completions += 1;
 	}
-	NCCL_OFI_TRACE_GIN_RECV_WRITE(dev, rail_id, len, this, peer_rank, msg_seq_num, req);
+	NCCL_OFI_TRACE_GIN_RECV_WRITE(dev, rail_id, cq_entry->len, this, peer_rank, msg_seq_num, req);
 
 	if (req->num_seg_completions == req->total_segments) {
 		/* Fill in the fields related to metadata */
@@ -902,7 +923,7 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(fi_addr_t src_add
 		req->metadata.msg_type = GIN_MSG_TYPE_METADATA;
 	}
 
-	ret = iput_signal_deliver_all(peer_rank);
+	int ret = iput_signal_deliver_all(peer_rank);
 
 	return ret;
 }

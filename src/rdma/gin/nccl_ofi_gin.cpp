@@ -6,6 +6,7 @@
 
 #include <mutex>
 #include <thread>
+#include <pthread.h>
 
 #include "rdma/gin/nccl_ofi_gin.h"
 
@@ -81,6 +82,9 @@ nccl_ofi_rdma_gin_put_comm::nccl_ofi_rdma_gin_put_comm(nccl_ofi_gin_resources &r
 	try {
 		gdrcopy_thread = std::thread(
 			&nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop, this);
+		pthread_setname_np(gdrcopy_thread.native_handle(), "ofi_gin_gdrcpy");
+		NCCL_OFI_INFO(NCCL_NET, "GIN comm_id=%zu: spawned gdrcopy worker thread",
+			      (size_t)local_comm_id);
 	} catch (const std::system_error &err) {
 		NCCL_OFI_WARN("Failed to spawn GIN gdrcopy worker thread: %s",
 			      err.what());
@@ -265,6 +269,7 @@ int nccl_ofi_rdma_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[]
 int nccl_ofi_rdma_gin_put_comm::send_ack(nccl_ofi_rdma_gin_put_comm &gin_comm, uint32_t peer_rank,
 			       uint32_t rx_consumed)
 {
+	gin_comm.ack_send_count++;
 	/* For now, always send acks on rail 0.
 	   TODO round-robin this like the payload data itself. */
 	const int rail_id = 0;
@@ -513,10 +518,19 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 	   so all comparisons mask the modular subtraction. */
 	const uint32_t outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
 	if (OFI_UNLIKELY(outstanding >= (uint32_t)(GIN_IMM_SEQ_MASK + 1))) {
-		NCCL_OFI_WARN("Outstanding window full (head=%u tail=%u)",
-			      rank_comm.tx_head, rank_comm.tx_tail);
+		NCCL_OFI_WARN("Outstanding window full (head=%u tail=%u) progress_calls=%lu ack_sent=%lu ack_recv=%lu",
+			      rank_comm.tx_head, rank_comm.tx_tail, progress_call_count,
+			      ack_send_count, ack_recv_count);
 		assert(false);
 		return -EBUSY;
+	}
+
+	/* Log every 1024 iputSignal posts */
+	iput_count++;
+	if (OFI_UNLIKELY(iput_count % 1024 == 0)) {
+		NCCL_OFI_INFO(NCCL_NET, "GIN flow: iput=%lu rank=%u head=%u tail=%u outstanding=%u ack_sent=%lu ack_recv=%lu progress=%lu",
+			      iput_count, dst_rank, rank_comm.tx_head, rank_comm.tx_tail,
+			      outstanding, ack_send_count, ack_recv_count, progress_call_count);
 	}
 
 	/* Determine if this message needs an ACK.
@@ -958,12 +972,18 @@ int nccl_ofi_rdma_gin_put_comm::enqueue_gdrcopy_work(uint32_t peer_rank,
 	req->gdrcopy_status = 0;
 
 	while (!gdrcopy_work_queue.push(work)) {
+		enqueue_spin_count++;
+		if (OFI_UNLIKELY(enqueue_spin_count % 100000 == 0)) {
+			NCCL_OFI_WARN("enqueue_gdrcopy_work: work_queue full, spinning (%lu iters)",
+				      enqueue_spin_count);
+		}
 		int drain_ret = drain_gdrcopy_done_queue();
 		if (OFI_UNLIKELY(drain_ret != 0)) {
 			return drain_ret;
 		}
 		asm volatile("" ::: "memory");
 	}
+	enqueue_spin_count = 0;
 	return 0;
 }
 
@@ -1032,8 +1052,14 @@ void nccl_ofi_rdma_gin_put_comm::run_gdrcopy_worker_loop()
 			/* Done queue full: brief pause, proxy will drain on its
 			 * next tick. Both rings share the same CAPACITY, so this
 			 * is unlikely under normal operation. */
+			done_push_spin_count++;
+			if (OFI_UNLIKELY(done_push_spin_count % 100000 == 0)) {
+				NCCL_OFI_WARN("gdrcopy_worker: done_queue full, spinning (%lu iters)",
+					      done_push_spin_count);
+			}
 			asm volatile("" ::: "memory");
 		}
+		done_push_spin_count = 0;
 	}
 
 	/* Signal the destructor that we have exited so it stops draining
@@ -1200,6 +1226,7 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg_t *ack_msg,
 						      fi_addr_t src_addr, uint16_t rail_id)
 {
+	ack_recv_count++;
 	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
 	uint32_t rx_consumed = ack_msg->rx_consumed;
 

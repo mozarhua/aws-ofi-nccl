@@ -306,6 +306,9 @@ public:
 		return outstanding_ack_counter > 0;
 	}
 
+	void increment_progress_call_count() { progress_call_count++; }
+	uint64_t get_progress_call_count() const { return progress_call_count; }
+
 	/**
 	 * Apply an inbound rx_consumed cursor from the peer (from a standalone
 	 * ACK). Wrap-safe: only advances tx_tail when the cursor represents
@@ -543,6 +546,12 @@ private:
 	nccl_ofi_spsc_ring<gin_signal_work_entry> gdrcopy_work_queue;
 	nccl_ofi_spsc_ring<gin_signal_done_entry> gdrcopy_done_queue;
 	std::thread gdrcopy_thread;
+	uint64_t enqueue_spin_count = 0;
+	uint64_t done_push_spin_count = 0;
+	uint64_t progress_call_count = 0;
+	uint64_t ack_send_count = 0;
+	uint64_t ack_recv_count = 0;
+	uint64_t iput_count = 0;
 
 	void run_gdrcopy_worker_loop();
 	int enqueue_gdrcopy_work(uint32_t peer_rank,

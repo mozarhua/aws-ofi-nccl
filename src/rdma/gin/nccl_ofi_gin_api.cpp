@@ -5,6 +5,8 @@
 #include "config.h"
 
 #include <cstring>
+#include <cstdlib>
+#include <unordered_map>
 
 #include "rdma/gin/nccl_ofi_gin.h"
 #include "rdma/gin/nccl_ofi_gin_api.h"
@@ -28,10 +30,14 @@ extern ncclGin_v13_t ncclGinPlugin_v13;
  */
 struct nccl_ofi_gin_context {
 	uint64_t comm_id; // Unique communicator identifier (from commHash)
-	
-	// Constructor to initialize comm_id
-	explicit nccl_ofi_gin_context(uint64_t id) : comm_id(id) {}
+	int init_seq;     // Per-commHash init sequence (distinguishes RMA vs GIN proxy ctx)
+	int listen_count; // Incremented per listen() call on this ctx
+
+	explicit nccl_ofi_gin_context(uint64_t id) : comm_id(id), init_seq(0), listen_count(0) {}
 };
+
+/* Per-commHash init counter — tracks how many init() calls per commId */
+static std::unordered_map<uint64_t, int> g_init_count_per_comm;
 
 ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogger_t logFunction)
 {
@@ -75,12 +81,15 @@ ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogger_t lo
 		return ncclInternalError;
 	}
 
-	/* Create per-communicator context to store the comm_id.
-	   This allows listen() to use comm_id as the endpoint key for
-	   endpoint lookup, giving each NCCL communicator its own
-	   endpoint instead of sharing one per thread. */
+	/* Create per-communicator context. The comm_id was historically used
+	   as the ep_table key in listen() so each NCCL communicator got its
+	   own endpoint, but listen() now always creates a fresh endpoint per
+	   call (one per GIN connection). The context is kept so the v13 ABI
+	   is unchanged and future per-communicator state has a place to
+	   live. */
 	try {
 		nccl_ofi_gin_context *context = new nccl_ofi_gin_context(commId);
+		context->init_seq = g_init_count_per_comm[commId]++;
 		*ctx = context;
 	} catch (const std::exception &e) {
 		NCCL_OFI_WARN("Failed to allocate GIN context: %s", e.what());
@@ -166,14 +175,14 @@ static ncclResult_t nccl_ofi_gin_getProperties(int dev, ncclNetProperties_v11_t 
 
 ncclResult_t nccl_ofi_gin_listen(void *ctx, int dev, void *handle, void **listenComm)
 {
-	/* Extract communicator ID from GIN context */
+	/* Validate the GIN context. We no longer key endpoints by comm_id (see
+	 * below), but the context is still allocated by nccl_ofi_gin_init() and
+	 * a NULL ctx is a programming error. */
 	nccl_ofi_gin_context *context = static_cast<nccl_ofi_gin_context *>(ctx);
 	if (context == nullptr) {
 		NCCL_OFI_WARN("GIN listen: ctx is NULL");
 		return ncclInternalError;
 	}
-
-	uint64_t comm_id = context->comm_id;
 
 	auto plugin = nccl_net_ofi_get_plugin();
 	if (plugin == nullptr) {
@@ -188,17 +197,34 @@ ncclResult_t nccl_ofi_gin_listen(void *ctx, int dev, void *handle, void **listen
 	}
 
 	try {
-		/* Note: although the GIN plugin uses its own endpoint type, we still need
-		the transport endpoint to set up the bootstrap AG ring.
+		/* Endpoint selection based on init_seq and listen_seq.
+		   Groups connections owned by the same NCCL GIN progress
+		   thread onto the same endpoint (avoids cross-thread lock
+		   contention). With round-robin thread assignment in NCCL
+		   (thread t owns connections t, t+T, t+2T, ...) and
+		   listen_seq % T in the EP key, connections on the same
+		   thread share one EP. Default NTHREADS=1 collapses all
+		   to one EP (original shared-endpoint behavior). */
+		static int nthreads = -1;
+		if (nthreads < 0) {
+			const char *env = getenv("NCCL_GIN_PROXY_NTHREADS");
+			nthreads = (env && atoi(env) > 0) ? atoi(env) : 1;
+		}
 
-		Use comm_id as endpoint_key to ensure all GIN contexts within the same
-		communicator share the same endpoint. This creates one endpoint per
-		communicator instead of one per thread.
-		
-		domain_key=0 uses the default domain, endpoint_key=comm_id caches endpoints
-		by communicator ID instead of thread ID. */
+		int listen_seq = context->listen_count++;
 
-		auto ep = device->get_ep(0, static_cast<long>(comm_id));
+		long ep_key = static_cast<long>(context->comm_id)
+			    ^ (static_cast<long>(context->init_seq) << 48)
+			    ^ (static_cast<long>(listen_seq % nthreads) << 32);
+
+		auto ep = device->get_ep(0, ep_key);
+		if (ep == nullptr) {
+			NCCL_OFI_WARN("GIN: failed to get endpoint on device %i.", dev);
+			return ncclSystemError;
+		}
+
+		NCCL_OFI_INFO(NCCL_NET, "GIN listen: comm_id=0x%lx init_seq=%d listen_seq=%d ep_key=0x%lx",
+			      context->comm_id, context->init_seq, listen_seq, ep_key);
 
 		nccl_net_ofi_listen_comm *l_comm = nullptr;
 		int ret = ep->listen(static_cast<nccl_net_ofi_conn_handle_t *>(handle), &l_comm);
@@ -230,6 +256,12 @@ ncclResult_t nccl_ofi_gin_connect(void *ctx, void *handles[], int nranks, int ra
 	} catch (const std::exception &e) {
 		NCCL_OFI_WARN("Caught exception in GIN connect: %s", e.what());
 		ret = -EINVAL;
+	}
+
+	if (ret == 0 && *collComm) {
+		auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(*collComm);
+		NCCL_OFI_INFO(NCCL_NET, "GIN connect: ctx=%p put_comm=%p comm_id=%u",
+			      ctx, gin_comm, gin_comm->get_local_comm_id());
 	}
 
 	return nccl_net_ofi_retval_translate(ret);
@@ -288,6 +320,11 @@ ncclResult_t nccl_ofi_gin_ginProgress(void *collComm)
 {
 	auto *gin_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(collComm);
 	std::lock_guard<std::mutex> lock(gin_comm->get_ep_lock());
+	gin_comm->increment_progress_call_count();
+	if (OFI_UNLIKELY(gin_comm->get_progress_call_count() == 1)) {
+		NCCL_OFI_INFO(NCCL_NET, "GIN progress: first call on put_comm=%p comm_id=%u",
+			      gin_comm, gin_comm->get_local_comm_id());
+	}
 	int ret = gin_comm->get_resources().progress();
 	if (OFI_UNLIKELY(ret != 0)) {
 		return nccl_net_ofi_retval_translate(ret);

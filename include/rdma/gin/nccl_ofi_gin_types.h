@@ -201,6 +201,6 @@ static_assert(
 /* Sender requests an ACK once the outstanding window is at least half full
    (i.e. tx_head - tx_tail >= GIN_ACK_REQ_THRESHOLD). The receiver answers
    via a standalone ACK packet carrying its rx_consumed cursor. */
-#define GIN_ACK_REQ_THRESHOLD ((GIN_IMM_SEQ_MASK + 1) / 2)
+#define GIN_ACK_REQ_THRESHOLD ((GIN_IMM_SEQ_MASK + 1) / 4)
 
 #endif

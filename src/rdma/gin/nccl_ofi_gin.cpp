@@ -515,16 +515,35 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 	uint16_t rail_id = 0;
 
 	/* Outstanding window. Cursors live on the GIN_RX_CONSUMED_MASK ring,
-	   so all comparisons mask the modular subtraction. */
-	const uint32_t outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
-	if (OFI_UNLIKELY(outstanding >= (uint32_t)(GIN_IMM_SEQ_MASK + 1))) {
-		NCCL_OFI_WARN("Outstanding window full (head=%u tail=%u) progress_calls=%lu ack_sent=%lu ack_recv=%lu",
-			      rank_comm.tx_head, rank_comm.tx_tail, progress_call_count,
-			      ack_send_count, ack_recv_count);
-		assert(false);
-		return -EBUSY;
+	   so all comparisons mask the modular subtraction.
+
+	   A full window is normal backpressure, not an error: we've sent
+	   GIN_IMM_SEQ_MASK+1 ops the receiver hasn't acknowledged yet. Don't
+	   abort -- keep driving progress until ACKs advance tx_tail and free a
+	   slot, then fall through to post. We can't just return -EBUSY: NCCL
+	   calls iputSignal through NCCLCHECK, so any nonzero return becomes
+	   ncclSystemError and kills the proxy. */
+	uint32_t outstanding;
+	{
+		std::unique_lock scoped_ep_lock(gin_ep.ep_lock);
+		outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
+		while (OFI_UNLIKELY(outstanding >= (uint32_t)(GIN_IMM_SEQ_MASK + 1))) {
+			int prog = resources.progress();
+			if (OFI_UNLIKELY(prog != 0)) {
+				return prog;
+			}
+			prog = drain_gdrcopy_done_queue();
+			if (OFI_UNLIKELY(prog != 0)) {
+				return prog;
+			}
+			scoped_ep_lock.unlock();
+			std::this_thread::yield();
+			scoped_ep_lock.lock();
+			outstanding = gin_cursor_delta(rank_comm.tx_head, rank_comm.tx_tail);
+		}
 	}
 
+#ifdef ACK_BACKPRESSURE_DEBUG
 	/* Log every 1024 iputSignal posts */
 	iput_count++;
 	if (OFI_UNLIKELY(iput_count % 1024 == 0)) {
@@ -532,6 +551,7 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 			      iput_count, dst_rank, rank_comm.tx_head, rank_comm.tx_tail,
 			      outstanding, ack_send_count, ack_recv_count, progress_call_count);
 	}
+#endif
 
 	/* Determine if this message needs an ACK.
 	 *

@@ -67,5 +67,6 @@ typedef struct {
 
   // Finalize the GIN support
   ncclResult_t (*finalize)(void* ctx);
+  ncclResult_t (*setHint)(void* ctx, const char* key, int value);
 } ncclGin_v13_t;
 #endif // end include guard

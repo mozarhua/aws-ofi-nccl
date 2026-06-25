@@ -32,8 +32,10 @@ struct nccl_ofi_gin_context {
 	uint64_t comm_id; // Unique communicator identifier (from commHash)
 	int init_seq;     // Per-commHash init sequence (distinguishes RMA vs GIN proxy ctx)
 	int listen_count; // Incremented per listen() call on this ctx
+	int thread_idx; // Set by NCCL via setHint("THREAD_IDX") before listen()
 
-	explicit nccl_ofi_gin_context(uint64_t id) : comm_id(id), init_seq(0), listen_count(0) {}
+	explicit nccl_ofi_gin_context(uint64_t id)
+		: comm_id(id), init_seq(0), listen_count(0), thread_idx(-1) {}
 };
 
 /* Per-commHash init counter — tracks how many init() calls per commId */
@@ -197,25 +199,30 @@ ncclResult_t nccl_ofi_gin_listen(void *ctx, int dev, void *handle, void **listen
 	}
 
 	try {
-		/* Endpoint selection based on init_seq and listen_seq.
-		   Groups connections owned by the same NCCL GIN progress
-		   thread onto the same endpoint (avoids cross-thread lock
-		   contention). With round-robin thread assignment in NCCL
-		   (thread t owns connections t, t+T, t+2T, ...) and
-		   listen_seq % T in the EP key, connections on the same
-		   thread share one EP. Default NTHREADS=1 collapses all
-		   to one EP (original shared-endpoint behavior). */
-		static int nthreads = -1;
-		if (nthreads < 0) {
-			const char *env = getenv("NCCL_GIN_PROXY_NTHREADS");
-			nthreads = (env && atoi(env) > 0) ? atoi(env) : 1;
-		}
-
+		/* Endpoint selection based on init_seq and thread_idx.
+		   If NCCL set THREAD_IDX via setHint before this listen(),
+		   use it directly. Otherwise fall back to listen_seq % nthreads
+		   (env var based, for backward compatibility). */
 		int listen_seq = context->listen_count++;
+		int thread_idx;
+
+		if (context->thread_idx >= 0) {
+			// NCCL provided explicit thread index via setHint
+			thread_idx = context->thread_idx;
+			context->thread_idx = -1;  // Consume: reset for next listen
+		} else {
+			// Fallback: plugin reads env var and computes internally
+			static int nthreads = -1;
+			if (nthreads < 0) {
+				const char *env = getenv("NCCL_GIN_PROXY_NTHREADS");
+				nthreads = (env && atoi(env) > 0) ? atoi(env) : 1;
+			}
+			thread_idx = listen_seq % nthreads;
+		}
 
 		long ep_key = static_cast<long>(context->comm_id)
 			    ^ (static_cast<long>(context->init_seq) << 48)
-			    ^ (static_cast<long>(listen_seq % nthreads) << 32);
+			    ^ (static_cast<long>(thread_idx) << 32);
 
 		auto ep = device->get_ep(0, ep_key);
 		if (ep == nullptr) {
@@ -446,6 +453,19 @@ ncclResult_t nccl_ofi_gin_finalize(void *ctx)
 	return ncclSuccess;
 }
 
+static ncclResult_t nccl_ofi_gin_setHint(void *ctx, const char *key, int value)
+{
+	if (ctx == nullptr || key == nullptr) {
+		return ncclInternalError;
+	}
+	nccl_ofi_gin_context *context = static_cast<nccl_ofi_gin_context *>(ctx);
+	if (strcmp(key, "THREAD_IDX") == 0) {
+		context->thread_idx = value;
+	}
+	// Unknown keys are silently ignored
+	return ncclSuccess;
+}
+
 static ncclResult_t nccl_ofi_gin_getProperties_v13(int dev, ncclNetProperties_v12_t *props)
 {
 	nccl_ofi_properties_t ofi_properties;
@@ -605,5 +625,6 @@ NCCL_OFI_EXPORT_SYMBOL ncclGin_v13_t ncclGinPlugin_v13 = {
 	.test = nccl_ofi_gin_test,
 	.ginProgress = nccl_ofi_gin_ginProgress,
 	.queryLastError = nullptr,
-	.finalize = nccl_ofi_gin_finalize
+	.finalize = nccl_ofi_gin_finalize,
+	.setHint = nccl_ofi_gin_setHint
 };
